@@ -1,0 +1,158 @@
+---
+title: Bettu Desktop Robot
+summary: An ESP32-C3 desk robot with an OLED face, touch and distance sensing, sound, a web dashboard and a hot-glued pan-tilt head. Behavior logic is plain C++ tested on a laptop, and hardware verification is tracked per feature.
+status: demonstrated
+statusNote: Display, touch, ToF, sound and OTA were confirmed on the real board according to the project's own log. Gestures, servos and most other features compile and pass host tests but are documented as not yet hardware-tested. No photos or video exist.
+category: Embedded / hardware
+tags: [ESP32-C3, PlatformIO, C++17, FreeRTOS, embedded, state machines, host-side testing, OLED]
+year: "2026"
+order: 3
+featured: true
+links: []
+facts:
+  - { label: "MCU", value: "ESP32-C3 SuperMini, 4 MB flash, native USB serial" }
+  - { label: "Sensors", value: "VL53L0X time-of-flight (facing up), TTP223 touch pad, MPU6050 optional (detect only)" }
+  - { label: "Output", value: "0.96 inch SSD1306 128x64 OLED, MAX98357A I2S amplifier and speaker, 2x SG90 servos" }
+  - { label: "Stack", value: "PlatformIO, Arduino-ESP32 3.3.x (pioarduino), U8g2, ArduinoJson, Unity, LittleFS, FreeRTOS" }
+  - { label: "Tests", value: "144 host tests in 9 suites, as reported in the project's own log. Not re-run." }
+  - { label: "Size", value: "About 10.8k lines of C++ in src and lib; firmware about 1.53 MB (89.8 percent of an OTA slot), RAM 58.1 KB, per the log" }
+  - { label: "Firmware version", value: "0.5.0-p3" }
+---
+
+## Problem and context
+
+A small desk robot is mostly an exercise in making many unreliable things feel like one character. A distance sensor flickers, a touch pad bounces, Wi-Fi drops, and a speaker needs a clean I2S stream, yet the face on a 128 by 64 screen has to react as if it were alive. Bettu is an ESP32-C3 build that grew from a single 812-line sketch into a layered firmware project with a dashboard, over-the-air updates and a small head that pans and tilts.
+
+## Why it exists
+
+It is a personal hardware project, and I do not have a record of the original brief: the prompt file in the folder is empty. The earlier sketch, a one-file prototype with spring-physics eyes, shake detection and a weather page, was kept untouched as a reference. The rewrite split it into modules so that each behavior could be tested on a laptop before it ever touched the board.
+
+## Architecture overview
+
+The firmware has two halves with a hard line between them. Hardware wrappers (display, touch pad, distance sensor, I2S, servo PWM, Wi-Fi, flash storage) live under `src/`. Everything that decides something lives in `lib/robot_logic`, which is pure C++17, makes no Arduino calls, and receives time as an argument rather than reading a clock.
+
+<Figure label="Fig. 1" caption="Firmware layers. A controller owns the modules and runs one cooperative loop. The logic library is the only part compiled for the host test environment.">
+<FlowDiagram
+  title="Firmware layers"
+  steps={[
+    { label: "main", sub: "setup, hands off to the controller", tone: "default" },
+    { label: "RobotController", sub: "owns modules, runs the loop, console and web API", tone: "default" },
+    { label: "Hardware modules", sub: "input, display, audio, motion, services, storage", tone: "default" },
+    { label: "robot_logic", sub: "pure C++17: classifiers, state machines, physics, parsers", tone: "store" },
+  ]}
+/>
+</Figure>
+
+The loop is cooperative and millisecond-based with no blocking delays: poll inputs, update emotions, dispatch events from a 16-slot queue, update personality, tick services, render with a 30 FPS cap. There are three FreeRTOS tasks on the single-core C3: the main loop, a weather fetch task, and an audio task at higher priority.
+
+## Hardware
+
+| Part | Interface | Note |
+|---|---|---|
+| SSD1306 OLED, 128x64 | I2C | drawn with U8g2 |
+| VL53L0X distance sensor | I2C plus a shutdown pin | mounted facing up for hand gestures; auto-recovery on bus errors |
+| TTP223 touch pad | one GPIO | classified in software |
+| MAX98357A amplifier and speaker | I2S, 16 kHz, 32-bit slots | the 32-bit slot width was a bring-up fix |
+| 2x SG90 servos | LEDC PWM at 50 Hz | external 5 V supply of at least 2 A; head is hot glue, no 3D printing |
+| Battery measurement | ADC pin reserved | not used yet |
+
+The pin map lives in a single header, and a separate circuit document holds the wiring. I leave exact pins out here on purpose; they are in the repository.
+
+## Technology choices
+
+- **PlatformIO with a native test environment.** One project builds firmware and runs Unity tests on the laptop, so a logic change gets a pass or fail in seconds, not a flash cycle.
+- **U8g2 for display.** The prototype used a different driver for a different controller; the rewrite standardized on U8g2 for the SSD1306. Why the prototype differed is not documented.
+- **LittleFS and a custom partition table** with two OTA slots of about 1.6 MB each and a 640 KB data partition, so voice clips and the gzipped dashboard fit and an update can roll back.
+- **Open-Meteo for weather.** It needs no API key, which removes a secret from the firmware. The prototype used a keyed service.
+- **ArduinoJson** for the dashboard's JSON API and weather parsing.
+
+## Design decisions and trade-offs
+
+**Time is injected.** Every state machine takes `nowMs`. That makes tests deterministic and removes the temptation to sleep inside logic. The trade-off is plumbing: each caller has to pass the time.
+
+**Touch is classified, not read.** A classifier turns raw pad edges into tap, double tap, stroke, tickle, hold and very long hold. Gestures from the distance sensor go through a separate recognizer (present, approach, hover, wave, double wave) with a 400 ms cooldown, so one wave does not fire twice.
+
+**Emotions have priorities.** Nine emotions compete under explicit priority rules, so a startling event can interrupt a calm one and then yield back, rather than the face thrashing between states.
+
+**Personality as a slow state machine.** Awake leads to sleepy, then asleep with a dimmed display, then display off.
+
+**Wi-Fi never blocks the face.** Reconnect uses backoff of 5, 10, 30, 60, then 300 seconds. If no credentials exist, a captive portal with a random WPA2 password shown on the OLED lets a phone configure the device.
+
+**OTA with rollback.** An update must confirm Wi-Fi within 60 seconds or the slot rolls back, with a five-minute overall timeout.
+
+<Callout type="warning" title="Known security limit">
+The dashboard and OTA endpoints have no authentication. That is documented in the project, and it means the device belongs on a trusted network only.
+</Callout>
+
+## Engineering challenges
+
+**Sound that actually plays.** Audio was first confirmed audible only after two fixes recorded in the bring-up log: a pin conflict with the SD pins, and switching to 32-bit I2S slots. There are 20 synthesized sounds plus 13 voice clips generated with a text-to-speech tool and uploaded to the flash filesystem.
+
+**A tight flash budget.** The firmware uses almost nine tenths of an OTA slot. The dashboard is a single HTML file embedded gzipped (roughly 9 to 13 KB), which is a deliberate answer to that pressure.
+
+**A flaky sensor bus.** The distance sensor wrapper has auto-recovery on I2C errors, so a bus fault triggers reinitialization instead of a stale reading driving gestures.
+
+**An unresolved bench problem.** After one over-the-air restart the log notes "no serial data received" over USB, and it ends there. I cannot say how it was resolved.
+
+## Implementation details
+
+A time-injected, host-testable debouncer in the style of the logic library (illustrative, my own sketch, not the project's code):
+
+```cpp
+// title: injected-time touch classifier, simplified
+struct TouchClassifier {
+  enum class Event { None, Tap, Hold };
+  Event update(bool pressed, uint32_t nowMs) {
+    Event e = Event::None;
+    if (pressed && !down_)   { down_ = true; t0_ = nowMs; held_ = false; }
+    if (pressed && down_ && !held_ && nowMs - t0_ >= kHoldMs) { held_ = true; e = Event::Hold; }
+    if (!pressed && down_)   { down_ = false; if (!held_ && nowMs - t0_ >= kDebounceMs) e = Event::Tap; }
+    return e;
+  }
+private:
+  static constexpr uint32_t kDebounceMs = 30, kHoldMs = 600;
+  bool down_ = false, held_ = false; uint32_t t0_ = 0;
+};
+```
+
+And the matching host test, which needs no board:
+
+```cpp
+// title: host test, no hardware
+void test_short_press_is_tap() {
+  TouchClassifier c;
+  TEST_ASSERT_EQUAL(TouchClassifier::Event::None, c.update(true, 1000));
+  TEST_ASSERT_EQUAL(TouchClassifier::Event::Tap,  c.update(false, 1100));
+}
+```
+
+The head follows the same pattern. A servo axis class handles limits and calibration, a head director chooses moves, and only a thin wrapper writes PWM. The nine host suites cover audio, emotion, a small flappy-style game's physics, gesture, head, personality, service backoff, touch, and tuning.
+
+## Implemented, in progress, planned
+
+Hardware status is the point of this table, so it is split by how each item was verified.
+
+| Evidence label | Items |
+|---|---|
+| Implemented, hardware-verified (per the project log) | OLED face, blinking and eye movement; touch emotions; distance sensor reading; diagnostics; sound output; dashboard reachable by IP; voice clips uploaded; over-the-air flashing |
+| Implemented, host-tested only (documented as not yet hardware-tested) | Extra expressions; idle animations; personality and display sleep; distance gestures; Home, Weather, Clock, Info, Settings, Game and Canvas screens; Wi-Fi backoff, captive portal and serial console; weather and NTP time; dashboard JSON API; OTA rollback; pan-tilt head with calibration; giggle emotion |
+| In progress | Hardware test lists for the head (M1 to M8) and audio (A1 to A9) are written and pending |
+| Planned | Refinement pass with a 12 hour soak test; battery monitoring and deep sleep with a charger board |
+| Planned (deferred) | Tamagotchi-style needs, Pomodoro timer, alarm and snooze, interaction statistics, easter eggs |
+
+A motion sensor (PIR) was dropped by decision. Note that the sound row above is partly in tension with the README, which still lists sound as untested while the log records bring-up; I follow the log.
+
+<Details summary="How the folders relate">
+There are five sibling folders: the legacy sketch, a step-3 foundation snapshot, a steps 4 to 5 snapshot, the full project, and a later copy of the full project. A recursive diff shows the last two are byte-identical in source, so the later copy is a snapshot, not a newer version. Together the snapshots show the build growing in stages. None of the folders is a git repository.
+</Details>
+
+## Lessons learned
+
+- **Split decisions from I/O on day one.** Every bug I could reproduce on the laptop was fixed in minutes. The bugs that needed the board were pin conflicts and slot widths, none of which a host test could have caught.
+- **Track verification per feature.** A single "done" flag hides that most of this project has never moved a servo. The table above is more honest than a feature list.
+- **Remove secrets from the architecture.** Choosing a keyless weather API and storing Wi-Fi credentials in the device's flash, not in source, meant the rewrite had nothing to leak. The legacy sketch did contain credentials, which is why it is excluded from this write-up, and I recommend rotating them (the project README says the same).
+- **Know what is unknown.** There is no soak test, no power measurement and no demo footage, so I make no stability claims.
+
+## What's next
+
+Run the head hardware checklist before calling servos supported, and make the mechanical assembly photographable. Finish the audio checklist, then the soak test. Add authentication to the dashboard before any use outside a home network. Resolve the serial problem after over-the-air restarts. Battery power comes only after those pass.

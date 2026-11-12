@@ -1,0 +1,188 @@
+---
+title: "RabbitMQ Beyond the Queue: Exchanges, Priorities, Persistence and Delayed Work"
+description: "A practical guide to RabbitMQ routing with direct, topic and fanout exchanges, priority delivery, durable queues, message TTL and delayed retries with dead-letter exchanges."
+date: "2026-11-11"
+status: "published"
+category: "Messaging Systems"
+tags: ["RabbitMQ", "AMQP", "Message Queues", "Distributed Systems"]
+featured: false
+series: "Article 05"
+related: ["iot-mqtt-kafka-ksqldb-mongodb", "cdc-mysql-debezium-kafka-elasticsearch"]
+---
+
+## The queue is only one part of the design
+
+RabbitMQ is often introduced as a queue: a producer sends a message, a worker receives it, and the queue absorbs bursts. That picture omits the decisions that determine whether the right worker receives the message, whether urgent work can move ahead, what survives a broker restart, and how a retry waits without holding a consumer open.
+
+In AMQP 0-9-1, publishers send to exchanges. Exchanges route to queues (or other exchanges) through bindings. Queues hold messages until consumers receive and acknowledge them. Priority, persistence, expiry and dead lettering each alter a different part of that path. Combining them without naming those boundaries leads to familiar failures: a message is published but unroutable, acknowledged by the broker but not safe across a restart, or delayed behind an unrelated message whose TTL has not elapsed.
+
+This article uses RabbitMQ 4.4 as the reference point for version-sensitive behavior. Most exchange, TTL and dead-letter examples apply to RabbitMQ 3.x and 4.x; quorum-queue priority and native delayed delivery differ by release. Examples use AMQP 0-9-1 concepts, with Java-like pseudocode where client APIs vary. No throughput claims are made.
+
+## A message’s route through the broker
+
+An exchange applies routing rules to the routing key and message properties. A binding connects an exchange to a queue and can carry a binding key. The exchange type decides how the key is interpreted.
+
+<Figure label="Fig 1" caption="Publishers choose an exchange and routing key. Bindings decide which queues receive a copy; each queue then owns its own delivery and acknowledgement state.">
+<FlowDiagram title="Publish to consume" steps={[{label:"Publisher",sub:"exchange + routing key"},{label:"Exchange",sub:"routing rules"},{label:"Bindings",sub:"zero or more matches"},{label:"Queue",sub:"ready → unacked",tone:"store"},{label:"Consumer",sub:"ack after processing"}]} />
+</Figure>
+
+The main exchange types solve different routing problems:
+
+| Exchange | Matching rule | Typical use |
+| --- | --- | --- |
+| Direct | Exact routing-key equality | Route `billing.invoice` to billing workers |
+| Topic | Dot-separated patterns: `*` matches one segment, `#` zero or more | Route `orders.eu.created` to regional and event-type subscribers |
+| Fanout | Every binding receives a copy; routing key is ignored | Broadcast configuration changes or cache invalidation |
+| Headers | Match message headers instead of routing key | Routing on several attributes when topic keys become awkward |
+
+The default exchange is a predeclared direct exchange with an empty name. RabbitMQ automatically binds each queue to it using the queue name as the binding key, which makes publishing to a queue name convenient. It is not a replacement for an explicit exchange when an application needs a stable routing topology. The [exchange guide](https://www.rabbitmq.com/docs/exchanges) describes the built-in types and their routing rules.
+
+### Fanout is broadcast to bindings, not to consumers
+
+A fanout exchange sends a copy to every bound queue. Two consumers on one queue compete for that queue’s messages; they do not each receive a copy. If three independent services each need every event, give each service its own queue and bind all three to the fanout exchange. That separates their backlog and acknowledgement state.
+
+This is useful for events that should be observed by independent systems, but it also makes queue lifecycle important. A temporary, auto-delete queue is appropriate for a connected UI session that can miss updates. It is wrong for an audit or billing consumer that must catch up after a restart. For a durable subscriber, declare a durable queue and a durable binding before the event is published.
+
+### Unroutable is not the same as rejected
+
+An exchange may match no bindings. By default, the broker can discard the message after accepting the publish. For critical publishers, use publisher confirms and publish with the `mandatory` flag so an unroutable message is returned to the publisher. An alternate exchange is another option for routing otherwise-unmatched messages to a holding queue.
+
+A confirm answers whether RabbitMQ accepted responsibility for the publish according to the destination queue’s semantics. It does not say that a consumer processed the message. Consumer acknowledgements cover the separate consumer-to-broker leg. Reliable applications handle both sides, as the [publisher confirms and acknowledgements guide](https://www.rabbitmq.com/docs/confirms) explains.
+
+## Priority queues: reorder work that is still waiting
+
+Priority is a property of a message; support for honoring it is a property of the destination queue. Publishers set an integer priority in message properties. Higher values are delivered before lower values among messages still ready in a priority-enabled queue.
+
+For a classic queue, priority support must be enabled at declaration time with `x-max-priority`. The value cannot be safely changed after the queue exists. RabbitMQ recommends a small range (typically two to four levels) because more levels cost additional queue resources. For a quorum queue, RabbitMQ 4.3 and later provide 32 strict levels (0–31) without `x-max-priority`; earlier RabbitMQ 4.0–4.2 quorum queues had only normal and high buckets. Check the version-specific [priority documentation](https://www.rabbitmq.com/docs/priority) before relying on ordering.
+
+```java
+// Illustrative AMQP 0-9-1 Java client setup for a classic priority queue.
+Map<String, Object> args = new HashMap<>();
+args.put("x-max-priority", 4);
+channel.queueDeclare("jobs", true, false, false, args);
+
+AMQP.BasicProperties urgent = new AMQP.BasicProperties.Builder()
+    .deliveryMode(2) // persistent message
+    .priority(4)     // highest configured level
+    .build();
+channel.basicPublish("jobs.exchange", "run", urgent, payload);
+```
+
+Priority is not preemption. If a consumer already has ten low-priority deliveries in flight because its prefetch is ten, a new urgent message waits until the consumer acknowledges work and frees a slot. Messages already being processed are not interrupted. Large prefetch values can therefore hide urgent work inside consumer buffers. Keep prefetch aligned with processing capacity, and use separate queues when urgent work needs dedicated capacity or a fairness guarantee. An unlimited stream of urgent messages can starve low-priority work; priorities should represent a small, explicit service policy rather than arbitrary business scores.
+
+## What “persistent queue” really means
+
+There is no single switch that makes a message indestructible. In AMQP 0-9-1, the durability story spans topology, message properties, broker confirmation and queue type:
+
+1. **Durable exchange and queue.** They are recreated after a broker restart. Bindings between durable entities are durable too.
+2. **Persistent message.** Set delivery mode 2. A transient message can be discarded during recovery even if its queue is durable.
+3. **Publisher confirms.** Wait for a confirm before treating a publish as accepted. Without it, a connection loss leaves the publisher unsure whether the broker received the message and whether it was made safe.
+4. **Consumer acknowledgement.** Use manual acknowledgements and acknowledge only after the side effect is committed. If the consumer dies before the ack, RabbitMQ can redeliver, so the handler should be idempotent.
+
+```text
+# Illustrative topology declarations; use the client library's API in applications.
+exchange: jobs.exchange     durable, direct
+queue:    jobs.work         durable, quorum
+binding:  jobs.exchange -- "run" --> jobs.work
+message:  delivery_mode=2, message_id=<stable application id>
+publisher: confirm mode enabled; handle nack, return and connection recovery
+consumer: manual ack after durable side effect; idempotent by message_id
+```
+
+For a replicated, highly available work queue, quorum queues are the usual starting point in current RabbitMQ. They use Raft replication and require a majority of members to make progress. A confirmed persistent publish to a quorum queue is confirmed after the queue safely replicates it. A durable classic queue is still a valid single-replica queue choice where its availability trade-offs are acceptable; classic queue mirroring was removed in RabbitMQ 4.0. Read the [quorum queue guide](https://www.rabbitmq.com/docs/quorum-queues) when selecting a type.
+
+Durability changes latency and disk demand. Batching confirms asynchronously is generally better than synchronously waiting for a round trip after every individual publish. Consumers should similarly bound unacknowledged deliveries and monitor their acknowledgement rate. Persistence is a system of publisher, queue, disk, replication and consumer behavior; setting a queue to durable alone does not close every loss window.
+
+## Message TTL and dead-letter exchanges
+
+RabbitMQ supports queue-level message TTL and per-message TTL. Queue-level TTL assigns the same maximum residence time to messages in that queue. Per-message TTL uses the AMQP `expiration` property, represented as a string containing milliseconds. If both are present, the lower TTL applies. TTL begins when the message enters a queue; the same published message routed to two queues can therefore expire at different times.
+
+An expired message is not delivered to consumers. Without a dead-letter exchange it is discarded. With a DLX configured, expiry is one of the reasons RabbitMQ dead-letters a message. Other reasons include a consumer reject/nack without requeue, a queue length limit, or a quorum-queue delivery limit. A DLX is an ordinary exchange, so its bindings determine where the dead-lettered copy is routed. Prefer policies for mutable settings such as TTL and DLX over hard-coded queue arguments; policies can be changed without redeploying the application. See [TTL and expiration](https://www.rabbitmq.com/docs/ttl) and [dead lettering](https://www.rabbitmq.com/docs/dlx).
+
+TTL is not an exact timer API. RabbitMQ guarantees an expired message will not be delivered, and tries to remove it at or shortly after expiry. In a classic queue, an expired message is normally removed when it reaches the head; a message with a later expiration can sit behind an earlier non-expired message and continue occupying resources. Quorum queues scan across priorities for TTL expiry, but expiry timing is still broker scheduling, not a real-time deadline. Use a scheduler or database-backed workflow when execution must happen at an exact wall-clock time.
+
+## Build a delay queue with TTL and a DLX
+
+A delay queue holds a message until its queue-level TTL expires, then dead-letters it back to the work exchange. A separate queue per delay tier avoids mixing different TTLs in one FIFO. For example, use a five-second queue and a one-minute queue, each with a fixed `message-ttl` policy.
+
+<Figure label="Fig 2" caption="Retry routing with fixed delay tiers. The delay queues are buffers; the work queue remains the only queue consumed by workers.">
+<FlowDiagram title="TTL plus dead-letter retry" steps={[{label:"Worker",sub:"transient failure"},{label:"Delay exchange",sub:"routing key: 5s"},{label:"jobs.delay.5s",sub:"message-ttl: 5000 ms",tone:"warn"},{label:"DLX → work exchange",sub:"after expiry"},{label:"jobs.work",sub:"retry when available",tone:"store"}]} />
+</Figure>
+
+Declare the queues and exchange once, then apply policy to the delay queue. This RabbitMQ CLI example sets a fixed five-second delay:
+
+```bash
+# Declare an exchange and durable quorum queues using rabbitmqadmin or your application.
+# Bind jobs.work to jobs.exchange with key "run".
+# Bind jobs.delay.5s to jobs.delay with key "5s".
+
+rabbitmqctl set_policy delay-5s '^jobs\.delay\.5s$' \
+  '{"message-ttl":5000,"dead-letter-exchange":"jobs.exchange","dead-letter-routing-key":"run"}' \
+  --apply-to queues
+```
+
+The publisher sends a failed, retryable job to `jobs.delay` with key `5s`. When the message expires in `jobs.delay.5s`, RabbitMQ dead-letters it to `jobs.exchange` with key `run`; the binding routes it back to `jobs.work`. Add other fixed tiers such as `30s` and `5m` by declaring additional delay queues and policies. Carry an attempt count or inspect RabbitMQ's `x-death` history, cap retries, and route exhausted or permanent failures to a dead-letter queue for inspection. Reusing the same DLX path without a retry limit can make a poison message cycle forever.
+
+```text
+jobs.exchange (direct)
+  └─ "run" ───────────────> jobs.work (quorum, durable)
+
+jobs.delay (direct)
+  ├─ "5s" ────────────────> jobs.delay.5s (quorum, TTL 5 s, DLX jobs.exchange / run)
+  ├─ "30s" ───────────────> jobs.delay.30s (quorum, TTL 30 s, DLX jobs.exchange / run)
+  └─ "5m" ────────────────> jobs.delay.5m (quorum, TTL 5 min, DLX jobs.exchange / run)
+```
+
+The playground below lets you switch exchange types, publish with different routing keys and priorities, and advance a synthetic clock. Watch a message route to one or more queues, then see delayed copies become ready after their TTL. Step after publishing several messages to observe priority ordering among work still waiting in each queue.
+
+<RabbitMqPlayground />
+
+Fanout creates a copy per bound queue, while direct and topic exchanges route by their respective key rules. A higher-priority message is selected before lower-priority messages still waiting; it cannot pull work back from a consumer's prefetch buffer. The simulated clock and dispatch rate are teaching assumptions, not broker timing or throughput measurements.
+
+### The reliability caveat in dead lettering
+
+Dead lettering is an internal republish. By default, RabbitMQ republishes a dead-lettered message without publisher confirms, then removes it from the source queue. If the target exchange or queue cannot accept it, the message can be lost. For a high-value retry flow, use quorum queues and configure [at-least-once dead lettering](https://www.rabbitmq.com/docs/dlx#safety) where supported. It requires the quorum-queue dead-letter strategy and compatible overflow configuration; it also keeps messages pending in the source until target confirms arrive, so monitor that backlog. If the flow is lower value and uses the default at-most-once dead-letter strategy, explicitly accept that loss window and make the job recoverable from its source of truth.
+
+Do not publish a different per-message expiration into one shared delay queue and expect a sorted scheduler. Expiration is evaluated against queue order, and classic queues can retain expired entries behind live ones until they reach the head. A small set of fixed TTL tiers has predictable routing; arbitrary schedules need a purpose-built scheduler or a supported native delay feature.
+
+## Native delayed delivery and the old plugin
+
+RabbitMQ 4.4 adds native delayed delivery for quorum queues. An AMQP 0-9-1 publisher can set `x-opt-delivery-time` to a `long` Unix timestamp in milliseconds. The message is routed and replicated immediately, confirmed when safely replicated, and only becomes available to consumers at the requested time. This removes the need for a TTL/DLX cycle when the deployment supports RabbitMQ 4.4 and quorum queues.
+
+The community `rabbitmq_delayed_message_exchange` plugin historically provided a delayed exchange using an `x-delay` header. Its repository was archived in September 2026 and documents important limitations, including node-local delayed-message storage. For new systems, prefer RabbitMQ's supported native feature on 4.4 or a TTL/DLX design when older versions or fixed retry tiers require it. Avoid treating an old plugin as a cluster-wide durable scheduler. Long-horizon schedules (days, weeks, or months) usually belong in a database or scheduling service with explicit cancellation and audit semantics.
+
+## Operations: measure the queue you actually built
+
+Alert on the behavior that matters to the application, not only whether the broker process is up:
+
+- **Ready and unacknowledged counts.** Rising ready messages usually mean arrival rate exceeds service rate. Rising unacknowledged messages can mean high prefetch, slow handlers or stuck consumers.
+- **Oldest message age.** Queue depth alone cannot distinguish a short burst from work that has been waiting beyond its business deadline.
+- **Publisher confirms and returns.** Track confirm latency, nacks, reconnects and mandatory returns so accepted-but-unroutable work is visible.
+- **Redelivery and dead-letter counts.** A loop can keep queue depth stable while every message is repeatedly failing. Track retries by reason and attempt.
+- **Delay queue depth and expiry flow.** A growing delay queue can indicate downstream failures, an incorrect TTL/DLX policy or a target queue that cannot accept dead letters.
+- **Consumer capacity and prefetch.** Too little concurrency slows draining; excessive in-flight work hides priority and increases redelivery after a crash.
+- **Disk, memory and quorum health.** Durable queues consume disk and replicas. Set queue length limits and capacity alerts before the broker reaches resource alarms.
+
+For operations, use stable queue names and policy-managed TTL/DLX values. Queue declarations are topology contracts: if an application redeclares an existing queue with incompatible attributes, RabbitMQ closes the channel with a precondition failure. Roll out queue changes deliberately and keep topology definitions under version control.
+
+## Choosing the primitive
+
+| Need | Start with | Watch for |
+| --- | --- | --- |
+| Route by event name or tenant | Topic exchange | Keep the key schema bounded and documented |
+| Send every event to independent services | Fanout exchange plus one queue per service | Each durable subscriber needs its own durable queue |
+| Move urgent waiting work ahead | Priority queue or separate service-class queues | Prefetch, starvation and redelivery affect observed order |
+| Survive restart and node loss | Persistent messages, publisher confirms, quorum queue, manual consumer acks | Idempotency remains necessary; acks are not end-to-end exactly once |
+| Retry after a few fixed intervals | TTL delay queues plus DLX | Dead-letter safety, cycle limits and queue head behavior |
+| Schedule at a precise future timestamp on RabbitMQ 4.4 | Quorum queue native delayed delivery | Version and protocol support; monitor delayed backlog |
+| Schedule long-term business events | Durable scheduler or database-backed workflow | Cancellation, clock semantics, audit and recovery |
+
+RabbitMQ gives useful routing and work-queue primitives, but the guarantees stop at defined boundaries. Exchanges route; queues retain and dispatch; publisher confirms cover the publish leg; consumer acknowledgements cover completion reporting; TTL controls residence time; dead lettering routes a message after a terminal queue event. Design each boundary explicitly, make handlers idempotent, and let the business deadline determine whether a queue is a good scheduler.
+
+## Assumptions and version notes
+
+<Callout type="assumption" title="Scope">
+
+The article describes AMQP 0-9-1 with RabbitMQ 4.4 as the current reference. Strict 32-level quorum priorities arrived in 4.3, and native quorum-queue delayed delivery arrived in 4.4. Classic queue priority configuration and TTL/DLX behavior are documented separately because queue type and release affect details. Configuration snippets are illustrative; validate topology, policy support, client property types and dead-letter strategy against the exact RabbitMQ release and managed service. No benchmark or delivery-time guarantee is implied.
+
+</Callout>

@@ -1,0 +1,469 @@
+---
+title: "Redis Beyond the Cache: Persistence, Pub/Sub and Streams, and What Each Actually Guarantees"
+description: "What Redis really promises once it holds data you cannot lose: RDB and AOF durability, async replication and failover loss, Pub/Sub at-most-once, lists as queues, and Streams consumer groups compared with Kafka."
+date: "2026-11-11"
+status: "published"
+category: "Data Systems"
+tags: ["Redis", "Streams", "Pub/Sub", "AOF", "Persistence"]
+featured: false
+series: "Article 04"
+related: ["iot-mqtt-kafka-ksqldb-mongodb", "cdc-mysql-debezium-kafka-elasticsearch"]
+---
+
+## The problem: a cache that quietly became a queue
+
+Most teams meet Redis as a cache or a rate limiter: keys with TTLs, data that can be rebuilt, a miss that costs one extra database query. The mental contract is "fast, and if it disappears we recompute". That contract is cheap to honour and it is why Redis is everywhere.
+
+The trouble starts when the same server is asked to hold work. A job queue, a notification fan-out, a back-pressure buffer in front of a slow dependency, an event feed between two services. The data is now the only copy of something that has not been processed yet, and the questions change: what survives a restart, what survives a failover, what happens to a message when the consumer dies halfway, what happens when memory runs out.
+
+Redis answers each of those questions differently depending on which feature you chose and how it is configured. Persistence, replication, Pub/Sub, lists and Streams are separate mechanisms with separate guarantees, and a design that mixes them up (for example, "we use Pub/Sub, and AOF is on, so messages are durable") is wrong in a way that only shows up during an incident.
+
+The author has used Redis in production for caching and rate limiting in multi-tenant platforms, and has worked on a workflow engine built around queue-based durable processing with back-pressure and rate limiting. This article is a design discussion drawn from that class of system and from the Redis documentation, not a report on one deployment, and it contains no measurements. Every number is either a documented default or product fact (qualified by version) or arithmetic explicitly labelled illustrative. Configuration and code are illustrative and not validated against a specific build unless stated.
+
+<Callout type="assumption" title="Version scope">
+
+Behavior is described for open-source Redis 7.x (7.0 and 7.2 in particular) and called out where Redis 6.x or earlier differs. Where a feature arrived in a specific release, the release is named. Forks and managed services may differ in defaults and in which commands are permitted, so check the documentation of what you actually run.
+
+</Callout>
+
+## Why single-threaded command execution shapes everything
+
+Redis executes commands on one thread. Since Redis 6.0 network reads and writes can be offloaded to I/O threads (`io-threads`, off by default), and a few operations run in background threads (lazy freeing, closing files, and the fsync of the append-only file), but the work of executing a command against the keyspace is serial. Two consequences follow, and most of the rest of this article is a restatement of them.
+
+First, every command is atomic with respect to every other command. There is no lock to take around `INCR`, a Lua script, or a `MULTI`/`EXEC` block; nothing else runs while they execute. That is why a rate limiter or a queue pop can be a single round trip with no coordination, and it is the reason Redis can offer Lua scripts and Functions (7.0) as a transactional primitive.
+
+Second, any slow command is a stall for every client. `KEYS *` on a large keyspace, `SMEMBERS` on a set with millions of members, a Lua script with a loop, deleting a huge key with `DEL` instead of `UNLINK`, and, most relevant to this article, any persistence work done on the main thread. The latency budget of the whole server is shared. A design that adds durability has to be judged by how much of that work lands on the one thread.
+
+There is also a structural consequence for scaling: one Redis process uses essentially one core for commands, so scaling writes means more processes (Cluster), not more threads. A single stream or list lives on one node in one process, which matters when we compare Streams with Kafka partitions later.
+
+## Data structures as messaging building blocks
+
+Redis is a data structure server, and its messaging features are thin layers over those structures:
+
+| Structure | Messaging use | Property that matters |
+| --- | --- | --- |
+| String | Flags, counters (`INCR`), lock tokens | Atomic increment, `SET NX PX` for conditional create with expiry |
+| List | Simple queue (`LPUSH` plus `BRPOP`, `LMOVE`) | O(1) at both ends, blocking pops, no per-element acknowledgement |
+| Sorted set | Delayed jobs (score is due time), sliding-window rate limits | Range by score, but you must poll or have a scheduler |
+| Hash | Job payload or state by id | Field-level update, no ordering |
+| Set | Deduplication, membership | `SADD` returns whether the member was new |
+| Stream (5.0) | Append-only log with consumer groups | IDs, replay by ID, per-group pending entries, explicit acknowledgement |
+| Pub/Sub | Fan-out to connected subscribers | No storage at all; not a data structure |
+
+Pub/Sub is the odd one out: it stores nothing, which is the whole story of its guarantees. The other messaging options inherit whatever durability and replication properties the keyspace has, which is why we start with persistence.
+
+## Persistence: what reaches disk and when
+
+Redis keeps its dataset in memory. Persistence is a side channel that produces a file from that memory, and there are two independent mechanisms: RDB snapshots and the append-only file (AOF). They can run together.
+
+<Figure label="Fig 1" caption="Two persistence paths. The AOF path runs per command and its fsync policy decides the loss window; the RDB path forks and writes a point-in-time image in a child process.">
+<FlowDiagram title="Persistence path" steps={[{label:"Client command",sub:"write command"},{label:"Memory",sub:"keyspace updated",tone:"store"},{label:"AOF buffer",sub:"in-process"},{label:"write()",sub:"to OS page cache"},{label:"fsync",sub:"per appendfsync policy",tone:"warn"},{label:"Disk",sub:"appendonlydir",tone:"store"}]} />
+<FlowDiagram title="Snapshot path" steps={[{label:"Trigger",sub:"save rules or BGSAVE"},{label:"fork()",sub:"child gets a page-table copy",tone:"warn"},{label:"Child writes RDB",sub:"temp file, copy-on-write"},{label:"rename()",sub:"atomic replace"},{label:"dump.rdb",sub:"point-in-time image",tone:"store"}]} />
+</Figure>
+
+### RDB snapshots: fork and copy-on-write
+
+An RDB file is a compact binary image of the dataset at one point in time. `BGSAVE` (or the `save` rules in the config) makes the server call `fork()`. The child process inherits a copy of the parent's page tables and sees a frozen view of memory; it serializes that view to a temporary file and, when finished, renames it over the previous snapshot. The parent keeps serving clients.
+
+The fork is cheap in data copied but not free: the kernel has to copy page tables, and that cost grows with resident memory. During the fork call the parent is blocked. Afterwards, whenever the parent modifies a page the child still shares, the kernel copies that page (copy-on-write), so a write-heavy workload during a snapshot can increase memory use substantially, in the worst case approaching double the dataset size. This is why a Redis instance should not be sized to use nearly all of the machine's RAM when persistence is on. Two operating-system settings matter: `vm.overcommit_memory=1` so that the fork does not fail on an apparently large allocation, and transparent huge pages disabled, because with huge pages a single small write can force copying a 2 MB page.
+
+The `save` directive expresses "snapshot if at least N changes happened in M seconds". The default in 7.0 is `save 3600 1 300 100 60 10000`; earlier versions defaulted to `save 900 1 300 10 60 10000`. Either way, an RDB-only deployment loses everything since the last snapshot on a crash. That window is minutes, not seconds, and for a queue it is far too long. RDB's strengths are different: compact files, fast restarts on large datasets, and an easy artifact to ship offsite.
+
+```properties
+# title: redis.conf (RDB, illustrative)
+save 3600 1 300 100 60 10000
+dbfilename dump.rdb
+dir /var/lib/redis
+rdbcompression yes
+rdbchecksum yes
+# refuse writes if the last background save failed (default yes)
+stop-writes-on-bgsave-error yes
+```
+
+### AOF: log the commands
+
+With `appendonly yes`, Redis appends every write command (in the Redis protocol format) to a log, and on startup replays it to rebuild the dataset. The decisive setting is `appendfsync`, which controls when the data is forced from the operating system's cache to the disk device:
+
+| `appendfsync` | Behavior | Loss window on a process or host crash | Cost |
+| --- | --- | --- | --- |
+| `always` | fsync before replying to the client (writes in one event-loop iteration share an fsync) | At most the command in flight; unacknowledged commands only | Highest latency; throughput bounded by disk sync rate |
+| `everysec` (default) | write each loop, fsync once per second in a background thread | About one second in the normal case; the documentation notes up to two seconds in edge cases | Low |
+| `no` | write only; the OS decides when to flush | Whatever the OS had not yet flushed, typically tens of seconds on Linux defaults | Lowest |
+
+Two subtleties are worth knowing. A Redis process crash by itself loses less than a host crash, because data that has been `write()`n into the page cache survives the death of the process; only a power loss or kernel crash drops the page cache. And with `everysec`, if the background fsync is still running after two seconds, the main thread may postpone its next write to the file to avoid blocking on the same file, which is why the "one second" figure is a typical case rather than a bound. The `aof_delayed_fsync` counter in `INFO persistence` records how often that happened.
+
+### AOF rewrite and the multi-part AOF in 7.0
+
+An append-only log of commands grows without bound: a counter incremented a million times is a million lines. AOF rewrite compacts it by forking a child that writes a minimal command sequence equivalent to the current dataset. It triggers automatically when the file has grown by `auto-aof-rewrite-percentage` (default 100) beyond its size after the last rewrite and is at least `auto-aof-rewrite-min-size` (default 64 MB), or manually with `BGREWRITEAOF`.
+
+Before 7.0 there was a single `appendonly.aof` file, and during a rewrite the parent kept an in-memory rewrite buffer of commands issued since the fork, to be appended at the end. That buffer cost memory and a final pause. Redis 7.0 changed the on-disk layout to a multi-part AOF stored in a directory (`appenddirname`, default `appendonlydir`): a manifest file, one base file (RDB or AOF format) holding the state at the last rewrite, and one or more incremental AOF files holding commands since. A rewrite creates a new base while the parent opens a new incremental file, so the rewrite-buffer handoff is no longer needed.
+
+```text
+# title: appendonlydir layout in Redis 7.x (illustrative names)
+appendonlydir/
+  appendonly.aof.1.base.rdb      # base, RDB-format when aof-use-rdb-preamble yes
+  appendonly.aof.1.incr.aof      # commands since the base
+  appendonly.aof.manifest        # lists the files and their order
+```
+
+`aof-use-rdb-preamble yes` (the default since 4.0) makes the rewrite write the base as an RDB image rather than as commands. Loading is then fast (RDB load plus a short tail of commands) while the incremental part keeps per-command durability. Do not copy individual files out of the directory by hand; the manifest is the source of truth, and the `redis-check-aof` tool in 7.0 operates on the manifest.
+
+```properties
+# title: redis.conf (AOF, illustrative)
+appendonly yes
+appenddirname "appendonlydir"
+appendfsync everysec
+aof-use-rdb-preamble yes
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+# do not fsync while a rewrite or save is running (trades safety for latency)
+no-appendfsync-on-rewrite no
+# load a truncated final command instead of refusing to start (default yes)
+aof-load-truncated yes
+# timestamp annotations in the AOF (7.0+), helps point-in-time recovery
+aof-timestamp-enabled no
+```
+
+Note `no-appendfsync-on-rewrite`. Setting it to `yes` avoids fsync stalls while a child is writing a large file, but during that period the effective policy is closer to `no`, so the loss window grows to whatever the OS had buffered. It is a latency-versus-durability exchange that should be a deliberate decision.
+
+### Corruption, truncated tails, and redis-check-aof
+
+The common failure is a crash or power loss while the last command was being written, leaving a truncated final record. With `aof-load-truncated yes` Redis loads everything up to the incomplete command, logs a warning, and starts. That is usually what you want, but a log line is the only signal, so alert on it.
+
+Corruption in the middle of the file is different: Redis refuses to start, because replaying past a bad record would silently produce a dataset that is wrong in an unknown way. The repair tool is `redis-check-aof`. Run it without `--fix` first to see where the file is damaged, back up the directory, then run it with `--fix`, which truncates the file at the last valid command. This discards every command after the damage, including the valid ones. Treat `--fix` as a decision to accept data loss and make it only after copying the files.
+
+```bash
+# title: AOF repair (illustrative; stop the server and copy the directory first)
+cp -a /var/lib/redis/appendonlydir /var/lib/redis/appendonlydir.bak
+redis-check-aof /var/lib/redis/appendonlydir/appendonly.aof.manifest
+redis-check-aof --fix /var/lib/redis/appendonlydir/appendonly.aof.manifest
+```
+
+### The durability and latency trade-off, honestly stated
+
+There is no setting that is both fully durable and as fast as no persistence. The options, in the order in which they cost latency:
+
+- RDB only: no per-command cost; loss on a crash is everything since the last snapshot; fork pauses and copy-on-write memory growth.
+- AOF `everysec`: small per-command cost, a background fsync, up to about a second of loss on host failure.
+- AOF `always`: an fsync on the command path; every acknowledged write is on stable storage (subject to the disk honouring flush), at a throughput cost that depends entirely on your storage.
+- Redis 7.2 `WAITAOF`: lets a client ask for acknowledgement that a write has been fsynced locally and/or on a number of replicas, so durability can be bought per write rather than per server. Use it for the few writes that need it.
+
+Fsync on a network volume with a write cache is nothing like fsync on local NVMe, and a drive that lies about flushing makes `always` meaningless; measure on the storage you will deploy.
+
+The lab below lets you vary the fsync policy and a crash moment and see which writes survive. Try `always`, `everysec` and `no` with the same write stream, then switch between a process crash and a power loss.
+
+<RedisPersistenceExplorer />
+
+What to take from it: under `always` the set of surviving writes equals the set of acknowledged writes, under `everysec` the tail of the last second is at risk in a host crash but not in a process-only crash, and under `no` the loss depends on when the OS flushed. The lab is a simplified model with a fixed rule per policy; real loss windows depend on kernel and device behavior.
+
+## Replication: async by default, and what that costs
+
+Redis replication is asynchronous. A replica connects to the master, performs an initial synchronization, and then receives the stream of write commands. The master replies to the client as soon as it has executed the command locally; it does not wait for any replica.
+
+The initial sync is a full resync: the master produces an RDB (to disk, or streamed straight to the replica with `repl-diskless-sync`, the default since 6.0) and sends it, buffering commands issued meanwhile. After a brief disconnect, the replica tries a partial resynchronization with `PSYNC` (improved in 4.0 so that replica and master can resume after a restart or a failover using a replication ID and offset). It succeeds if the master still holds the missing bytes in the replication backlog, a ring buffer controlled by `repl-backlog-size` (default 1 MB). If the backlog has already overwritten what the replica needs, a full resync happens, which is expensive: a fork on the master, a full transfer and a full load on the replica. On a write-heavy master, one megabyte covers very little time, so size the backlog for the longest disconnection you want to survive without a full resync.
+
+### WAIT and min-replicas-to-write
+
+Two tools reduce, but do not remove, the window in which an acknowledged write exists on only one node.
+
+`WAIT numreplicas timeout` blocks the calling client until the given number of replicas have acknowledged all writes sent on that connection, or the timeout expires. It returns the number of replicas that acknowledged. It does not make Redis a strongly consistent store: if the reply is less than requested, the write is already applied on the master and will not be rolled back; and a replica acknowledging means it has received the write, not that it has fsynced it (that is what `WAITAOF` in 7.2 adds).
+
+`min-replicas-to-write N` with `min-replicas-max-lag S` (named `min-slaves-*` before 5.0) makes the master refuse writes unless at least N replicas are connected with lag of at most S seconds. It bounds how long a partitioned master keeps accepting writes it cannot replicate. The lag is measured by the replicas' periodic acknowledgements, so it has a granularity of about a second.
+
+```bash
+# title: replication checks (illustrative)
+redis-cli CONFIG SET min-replicas-to-write 1
+redis-cli CONFIG SET min-replicas-max-lag 10
+redis-cli INFO replication
+# in a client: write, then require one replica to have it
+#   SET order:1001 paid
+#   WAIT 1 100
+```
+
+### Failover and the acknowledged-write loss
+
+Redis Sentinel and Redis Cluster both promote a replica when a master is judged to have failed. Because replication is asynchronous, the promoted replica may not have received the last writes the old master acknowledged. After promotion, those writes exist only on the old master, and when it rejoins it becomes a replica of the new master and discards its divergent data. The result is acknowledged-write loss, and it is a property of the design rather than a bug.
+
+The sequence in Sentinel: a quorum agrees the master is unreachable, one Sentinel runs the failover and promotes a replica (by priority, then replication offset, then run ID). A client still connected to the old master across a partition keeps writing to it until the partition heals or `min-replicas-to-write` stops it; those writes are lost.
+
+Redis Cluster behaves similarly per shard. A master that cannot reach a majority of masters stops accepting writes after `cluster-node-timeout`, and its replica can be promoted; writes accepted by the old master during the interval are lost. Cluster also offers `cluster-require-full-coverage` (default yes) to refuse queries if any slot range is uncovered, a trade of availability for consistency in the other direction.
+
+The practical conclusion: Redis gives node durability (AOF) and availability through failover, not a guarantee that an acknowledged write survives failover, unless you add `WAIT` or `WAITAOF` per write. That is acceptable for caches, rate limiters and best-effort queues; not for the only copy of a payment event.
+
+## Eviction and maxmemory: the setting that deletes your queue
+
+`maxmemory` caps the memory used for data, and `maxmemory-policy` decides what happens at the cap. The default is `noeviction`: writes that would add memory fail with an `OOM` error, reads continue. The `allkeys-*` policies (`allkeys-lru`, `allkeys-lfu`, `allkeys-random`) may delete any key, and the `volatile-*` policies delete only keys with a TTL.
+
+The rule that follows is simple. If the same instance holds a queue, a stream, or any data you cannot regenerate, never use an `allkeys-*` policy: under memory pressure Redis will evict the list or stream holding your pending work, and no error is raised anywhere. A `volatile-*` policy is safer only if every non-expendable key is guaranteed to have no TTL, which is a convention that someone eventually breaks. The robust design is separation: cache workloads on an instance with an eviction policy, durable workloads on an instance with `noeviction`, with an alert on memory use well before the cap. A replica does not evict independently; it receives the master's `DEL` commands for evicted keys, so eviction decisions are the master's.
+
+With `noeviction` the failure is visible and survivable: producers get an error and can back off, consumers can still drain (commands like `XACK`, `LREM`, `XDEL` and `UNLINK` free memory). That is back-pressure with a loud signal, which is what a queue should do.
+
+## Pub/Sub: fan-out with no memory
+
+`SUBSCRIBE channel` registers a connection; `PUBLISH channel message` delivers the message to every connection currently subscribed and returns how many received it. That is the entire model.
+
+- **At most once, no storage.** A message is delivered to the subscribers that are connected at the instant of publication. A subscriber that is disconnected, restarting, or slow when the message is published never sees it, and there is no replay. AOF and RDB do not contain published messages; they are not data.
+- **No acknowledgement.** The publisher learns a count of receivers, not whether any of them processed the message.
+- **Slow subscribers are disconnected.** The server buffers outgoing messages per client in an output buffer. The setting `client-output-buffer-limit pubsub 32mb 8mb 60` (the default) closes the connection if the buffer exceeds 32 MB, or stays above 8 MB for 60 seconds. A subscriber that falls behind therefore loses messages in bulk, silently from the publisher's point of view, and must resubscribe and accept the gap.
+- **Pattern subscriptions.** `PSUBSCRIBE news.*` matches channels with glob patterns. Each publish is tested against all active patterns, so cost grows with the number of pattern subscriptions across all clients; a few broad patterns are fine, tens of thousands are a latency problem on the single thread.
+- **Replication.** Messages published on a master are propagated to its replicas and delivered to their subscribers. In Cluster, classic `PUBLISH` is broadcast to every node over the cluster bus, so every node does work for every message regardless of whether it has subscribers.
+
+### Sharded Pub/Sub in 7.0
+
+Redis 7.0 added `SPUBLISH` and `SSUBSCRIBE`. The channel name is hashed to a slot like a key, and the message is propagated only within the shard that owns the slot (its master and replicas), not to the whole cluster. That removes the all-nodes broadcast and makes Pub/Sub volume scale with the number of shards. The costs: a subscriber must connect to a node of the owning shard (client libraries handle this by slot), an `SSUBSCRIBE` with several channels requires all channels in one slot, and a slot migration causes the subscriber to be disconnected from the node that lost the slot, so subscribers must handle the resubscribe. The semantics are otherwise the same: at most once, nothing stored.
+
+### Keyspace notifications
+
+`notify-keyspace-events` (off by default) makes Redis publish events such as `expired` or `set` on special channels like `__keyevent@0__:expired`. Caveats that matter for design:
+
+- They are Pub/Sub, so they are lossy: a disconnected listener misses events, and there is no replay.
+- The `expired` event is emitted when Redis actually removes the key, which happens lazily when accessed or by the active expiry cycle, not at the exact TTL. Do not use it as a timer; the delay can be noticeable under load.
+- In Cluster, events are node-local, so a listener has to subscribe on every master (and the events do not describe keys moved by migration).
+
+The rule: use Pub/Sub for ephemeral signals where losing a message is fine (cache invalidation hints, presence, UI updates where the next state supersedes the last). Do not use it for work that must happen.
+
+## Lists as queues, and the limits of the reliable-queue pattern
+
+The oldest Redis queue is a list: producers `LPUSH`, consumers `BRPOP`, which blocks until an element is available. It is atomic and simple, and it has a flaw that matters. The element is removed from the list when the server pops it. If the consumer crashes after the server pops the element but before it finishes processing (or the connection dies before the reply arrives), the job is gone.
+
+The reliable-queue pattern moves the element instead of deleting it. `RPOPLPUSH` and its blocking variant `BRPOPLPUSH` atomically pop from one list and push to another; both were deprecated in 6.2 in favour of `LMOVE` and `BLMOVE`, which take explicit directions. In 7.0, `LMPOP` and `BLMPOP` pop multiple elements, from the first non-empty of several lists.
+
+```bash
+# title: reliable list queue (illustrative)
+# producer
+redis-cli LPUSH jobs '{"id":"j-1","type":"resize"}'
+
+# worker: atomically move one job to its processing list (blocks up to 5 s)
+redis-cli BLMOVE jobs processing:worker-7 RIGHT LEFT 5
+
+# when the job is done, remove exactly that element
+redis-cli LREM processing:worker-7 1 '{"id":"j-1","type":"resize"}'
+```
+
+If the worker dies, the job remains in `processing:worker-7`. The pattern's limits are what a stream was designed to fix:
+
+- There is no visibility timeout. Something external has to notice that `processing:worker-7` belongs to a dead worker, move its jobs back, and avoid doing so for a worker that is merely slow.
+- Ownership is a naming convention. Nothing in Redis records who holds an element or for how long.
+- There is no delivery count, so a poison job that crashes every worker loops forever unless the payload carries a counter that you update (and updating it is a non-atomic edit of the element).
+- `LREM` finds the element by value, an O(N) scan of the processing list; identical payloads are ambiguous. Use unique ids in the payload.
+- A list is a single FIFO with no consumer groups, no replay and no way to inspect the history of what was consumed.
+
+Lists remain a good fit for simple, single-purpose, loss-tolerant or externally-reconciled queues, and for the "work item id" role in a larger design where the payload lives in a hash. Past that, writing a reaper and a retry counter is writing a worse Stream.
+
+## Streams: an append-only log with consumer groups
+
+Streams (Redis 5.0) are an append-only log stored in a radix tree of compact blocks. Each entry is a set of field-value pairs identified by an ID.
+
+### Entries and IDs
+
+`XADD orders * sku A12 qty 2` appends an entry; the `*` asks Redis to generate the ID, of the form `<milliseconds>-<sequence>`, such as `1731312000123-0`. IDs are strictly increasing within a stream: if the clock moves backwards, Redis keeps the last ms and increments the sequence. You can supply your own ID if it is greater than the top ID. Range reads (`XRANGE`, `XREVRANGE`) address entries by ID, and `XLEN` gives the count.
+
+### XREAD and XREADGROUP
+
+`XREAD COUNT 10 BLOCK 5000 STREAMS orders 1731312000123-0` returns entries with an ID greater than the one given, blocking up to 5 seconds if there are none. The consumer is responsible for remembering the last ID it processed; Redis tracks nothing. Using `$` means "only entries added after this call", which is how a late joiner starts at the tail. This is the log mode: any number of independent readers, each with its own cursor, none affecting the others.
+
+`XREADGROUP` is the work-queue mode. A consumer group is a named cursor and a set of consumers attached to a stream:
+
+```bash
+# title: create a group and consume (illustrative)
+# create the group at the start of the stream (use $ to start at the tail); MKSTREAM creates the stream if absent
+redis-cli XGROUP CREATE orders billing 0 MKSTREAM
+
+# a consumer asks for new entries (">" means never delivered to this group)
+redis-cli XREADGROUP GROUP billing worker-1 COUNT 10 BLOCK 5000 STREAMS orders ">"
+
+# after processing, acknowledge
+redis-cli XACK orders billing 1731312000123-0
+```
+
+When the group delivers an entry to a consumer it adds the entry to that group's Pending Entries List (PEL), recording the consumer, the delivery time and a delivery counter. The entry stays pending until the consumer sends `XACK`. Each entry in the stream is delivered to one consumer in the group, so consumers in a group share the load, and different groups on the same stream each get every entry. That is the difference from lists (one destination) and from Pub/Sub (no memory).
+
+### The PEL, XPENDING and recovery
+
+Pending entries are the system's memory of unfinished work. `XPENDING orders billing` gives a summary (count, smallest and largest pending ID, per-consumer counts). The extended form lists entries with their idle time and delivery count and can filter by consumer and, from 6.2, by minimum idle time:
+
+```bash
+# title: inspect and recover (illustrative)
+redis-cli XPENDING orders billing - + 10
+redis-cli XPENDING orders billing IDLE 60000 - + 10        # idle at least 60 s (6.2+)
+
+# take over entries idle for 60 s, scanning from the start (6.2+)
+redis-cli XAUTOCLAIM orders billing worker-2 60000 0-0 COUNT 10
+```
+
+`XCLAIM` transfers named entries to a consumer if they have been idle for at least a minimum time, and increments their delivery counter (unless `JUSTID` is used). `XAUTOCLAIM`, new in 6.2, does the scan and claim in one call and returns a cursor for the next call; in 7.0 it also reports IDs that no longer exist in the stream, so you can remove them from the PEL. The minimum idle time is the visibility timeout, and it is you who sets it: too short and a slow consumer's work is stolen and done twice; too long and recovery after a crash is slow.
+
+A consumer that restarts can read its own pending entries by passing `0` instead of `>` to `XREADGROUP`, which replays entries already delivered to it and not acknowledged. Together these make delivery at-least-once: an entry is delivered, and unless acknowledged is delivered again.
+
+<SequenceDiagram title="Consumer crash and redelivery" actors={["Producer","Redis stream","Worker A","Worker B"]} messages={[{from:"Producer",to:"Redis stream",label:"XADD orders *",note:"id 100-0"},{from:"Worker A",to:"Redis stream",label:"XREADGROUP > ",note:"receives 100-0"},{from:"Redis stream",to:"Redis stream",label:"PEL: 100-0 owned by A",note:"delivery count 1"},{from:"Worker A",to:"Worker A",label:"crash before XACK"},{from:"Worker B",to:"Redis stream",label:"XAUTOCLAIM min-idle 60000"},{from:"Redis stream",to:"Worker B",label:"100-0 reassigned",note:"delivery count 2",dashed:true},{from:"Worker B",to:"Redis stream",label:"XACK 100-0"},{from:"Redis stream",to:"Redis stream",label:"PEL entry removed"}]} />
+
+### Poison messages and idempotency
+
+Nothing in Streams has a dead-letter queue. The delivery counter, visible in `XPENDING`'s extended form, is the raw material: a reaper that sees a count above a threshold copies the entry to a separate stream (for example `orders:dead`) with `XADD`, then `XACK`s the original. That is a few lines, and it is yours to write and operate.
+
+At-least-once means a consumer must tolerate seeing the same entry twice, after a crash between "side effect done" and "XACK sent", or after a claim of a slow worker's entry. The design pattern is idempotency: make the effect safe to repeat. Use a natural business key (order id) in a unique constraint in the database, an upsert, or a conditional write; a deduplication key set with `SET dedup:<id> 1 NX EX 86400` before the effect and checked on retry. Redis cannot give exactly-once effects on an external system; it can only give you the information (a stable ID and a delivery counter) to build them.
+
+```python
+# title: consumer loop sketch (illustrative, redis-py 5.x, Redis 7.x)
+import redis
+
+r = redis.Redis(host="redis", port=6379, decode_responses=True)
+STREAM, GROUP, ME = "orders", "billing", "worker-1"
+
+try:
+    r.xgroup_create(STREAM, GROUP, id="0", mkstream=True)
+except redis.ResponseError as e:
+    if "BUSYGROUP" not in str(e):
+        raise  # group already exists is fine
+
+def handle(entry_id, fields):
+    # Must be idempotent: the same entry can arrive twice.
+    # e.g. INSERT ... ON CONFLICT (order_id) DO NOTHING
+    ...
+
+def drain(entries):
+    for entry_id, fields in entries:
+        handle(entry_id, fields)
+        r.xack(STREAM, GROUP, entry_id)  # ack only after the effect is durable
+
+while True:
+    # 1) recover work abandoned by dead or slow consumers (idle > 60 s)
+    reply = r.xautoclaim(STREAM, GROUP, ME, min_idle_time=60_000,
+                         start_id="0-0", count=10)
+    drain(reply[1])  # reply is (next_start_id, entries, deleted_ids) on 7.x
+    # 2) read new entries
+    resp = r.xreadgroup(GROUP, ME, {STREAM: ">"}, count=10, block=5000)
+    for _stream, entries in resp or []:
+        drain(entries)
+```
+
+The sketch omits retries bounded by delivery count, clean shutdown, reconnect backoff and a timer for the claim step.
+
+### Trimming: XTRIM, MAXLEN, MINID and the tilde
+
+A stream grows until you trim it, and Redis does not do so on its own. `XADD ... MAXLEN ~ 100000` or a separate `XTRIM` keeps the stream near a length; `MINID` (6.2) trims entries older than an ID, which is the natural way to express "keep the last 24 hours" since IDs begin with a millisecond timestamp. The `~` makes trimming approximate: Redis removes only whole internal nodes (governed by `stream-node-max-entries`, default 100, and `stream-node-max-bytes`), so the stream may keep slightly more than requested but trimming is cheap. Exact trimming (`=`, the default when no modifier is given) can do more work per call. `LIMIT` caps the work done per call when used with `~`.
+
+Trimming ignores consumer groups. If a group has not yet read an entry and you trim it, the entry is gone, and the group's later `XREADGROUP` will not see it. Entries in the PEL that were trimmed can still be listed there but `XCLAIM` cannot fetch their content (`XAUTOCLAIM` reports them as deleted in 7.0). So the retention window has to be larger than the worst-case consumer lag, and you must alert on lag, not just length.
+
+### Observing a stream: XINFO and lag
+
+`XINFO STREAM orders` shows length, first and last entry and, from 7.0, the last generated ID, the maximal deleted entry ID, total entries added and the first recorded entry ID. `XINFO GROUPS orders` lists, per group, the number of consumers, the number of pending entries, the last delivered ID and, from 7.0, `entries-read` and `lag`: the number of entries in the stream not yet delivered to the group. `lag` can be returned as null when it cannot be computed exactly, for instance after entries were deleted with `XDEL` in the middle of the range, so alert on it with a fallback. `XINFO CONSUMERS orders billing` lists each consumer with its pending count and idle time (and, from 7.2, an `inactive` time since last successful interaction). Consumers are never removed automatically; a worker that came and went with a unique name leaves an entry until you call `XGROUP DELCONSUMER`, so use stable consumer names.
+
+### Memory behavior of streams
+
+Streams are compact for small entries (listpacks with delta-encoded IDs) but are still RAM, and that memory is also copied by `fork()` during a snapshot and replicated in full. Illustrative arithmetic: one million 200-byte entries is roughly 200 MB of payload before overhead. Streams suit a bounded buffer of minutes to hours, not days of high-volume retention.
+
+### Persistence and replication of streams
+
+A stream is an ordinary value as far as RDB, AOF and replication are concerned. The writes `XADD`, `XACK`, `XCLAIM` and group changes are propagated and logged like other commands, so group state (PELs, last delivered IDs) survives a restart under the same durability settings as everything else, and it is subject to the same asynchronous replication loss on failover. After a failover to a replica that was behind, a consumer may see entries it had already acknowledged reappear as pending, or lose entries that producers had been told were stored. Both are within the at-least-once contract for the first case and a violation of expectations for the second; the second is why producers on important streams use `WAIT` or `WAITAOF` for the `XADD`.
+
+## Choosing between Pub/Sub, lists, Streams and Kafka
+
+The table summarizes semantics rather than throughput; no performance comparison is claimed or implied.
+
+| Property | Pub/Sub | List (LMOVE pattern) | Stream with consumer groups | Kafka |
+| --- | --- | --- | --- | --- |
+| Stored | No | Yes, until popped or removed | Yes, until trimmed | Yes, on disk until retention or compaction |
+| Delivery | At most once, to connected subscribers | At least once with a processing list and your own reaper | At least once, with PEL and claim | At least once by default; exactly once within Kafka via transactions and idempotent producers |
+| Replay | No | No (consumed items are gone) | Yes, by ID, while retained | Yes, by offset, within retention |
+| Multiple independent consumers | Yes, all connected get all | No (competing consumers only) | Yes, one group per consumer set | Yes, one group per consumer set |
+| Acknowledgement | None | `LREM` by value | `XACK` per entry per group | Offset commit (a position, not per message) |
+| Per-message retry state | None | None (you build it) | Delivery count and idle time in PEL | None built in; retry topics are a pattern |
+| Ordering | Per channel, per publisher connection | FIFO per list | Total order per stream; parallel consumers lose processing order | Per partition |
+| Horizontal scale of one flow | Sharded Pub/Sub (7.0) | One key on one node | One key on one node; shard across keys yourself | Partitions spread across brokers |
+| Capacity bound | Memory of output buffers | RAM | RAM (plus fork and replication cost) | Disk and retention |
+| Operational ecosystem | Minimal | Minimal | Minimal, plus your reaper | Connectors, schema registry, stream processing |
+
+Redis Streams are the right tool when the flow is moderate, the data is already in Redis, you want sub-millisecond-class round trips and a few commands rather than a platform, the retention is short, and a team can accept the operational semantics above (at-least-once, manual dead-lettering, failover loss unless `WAIT`). Examples: a work queue between services of one product, a back-pressure buffer for rate-limited downstream calls, a short-window event feed to a dashboard. This is the territory of the workflow-engine style of queue-based durable processing that the author has worked with.
+
+Kafka is the right tool when the log is the system of record or integration backbone: retention of days or more, many consumers replaying from arbitrary offsets, partitioned parallelism with per-key ordering, stream processing and connectors. The sibling articles on MQTT to Kafka to MongoDB telemetry and CDC from MySQL to Elasticsearch are cases where the log must outlive consumers. The decision turns on retention and fan-out, not speed.
+
+The next lab puts the two Redis mechanisms side by side. Publish a few messages while one subscriber is disconnected, then reconnect it, and compare what a Pub/Sub subscriber and a stream consumer see.
+
+<RedisPubSubVsStreams />
+
+The expected result is that the Pub/Sub subscriber never sees the messages published while it was away, while the stream consumer reads them on reconnect from its last position, and an unacknowledged entry reappears. It is a conceptual simulation of the semantics, not a measurement of either system.
+
+## Consumer groups in motion
+
+Group behavior is easiest to understand by watching the PEL change. Three things to hold in mind: the group's last-delivered ID advances when entries are delivered, not acknowledged; the PEL shrinks only on `XACK`; and a claim changes owner without moving the group cursor.
+
+In the next lab you can add consumers, deliver entries, acknowledge some, stop a consumer so its entries go idle, and claim them from another. Try stopping a consumer after it has been delivered several entries, then use claim with a small and a large idle threshold, and watch the delivery counter.
+
+<RedisStreamGroupExplorer />
+
+Interpretation: entries held by the stopped consumer remain pending and are invisible to other consumers until claimed; a claim with a threshold above the entry's idle time moves nothing; a successful claim increments the delivery counter, so an entry that keeps bouncing is visible by its count. The lab abstracts time as steps; in a real system the idle time is wall-clock milliseconds.
+
+One more consequence: a claim threshold shorter than the real job time reassigns work from a healthy but slow consumer, so the effect runs twice with no crash at all. Either heartbeat (an `XCLAIM` of your own entry with `JUSTID` resets its idle time) or set the threshold well above the tail of the job duration.
+
+## Rate limiting and locks: short notes
+
+Rate limiting is the most forgiving Redis workload, because the data is small and losing a window's counters on failover merely lets a few extra requests through. The usual shapes are a fixed window (`INCR` a key per window and set its expiry; do both atomically with a script, or `SET key 0 EX n NX` then `INCR`), a sliding window with a sorted set of timestamps (`ZADD`, `ZREMRANGEBYSCORE`, `ZCARD` in one script), and a token bucket held in a hash and refilled by arithmetic inside a Lua script or a Redis Function (7.0). Atomicity comes from the single-threaded execution model; in Cluster, a script's keys must share a slot, usually by a hash tag on the tenant id. Decide explicitly what happens when Redis is unreachable: fail open (requests pass; protects availability) or fail closed (requests are rejected; protects the downstream). A lock is the other common use. The single-instance pattern is `SET lock:resource <random-token> NX PX 30000` and release through a script that deletes the key only if the token still matches. Its failure modes: the holder pauses (garbage collection, a stalled process) past the TTL and another client takes the lock, so two clients believe they hold it; and a failover can lose the lock key, since replication is asynchronous. Redlock, the algorithm that uses several independent Redis instances, has been the subject of a public disagreement between its author and Martin Kleppmann about its safety under timing assumptions (process pauses, clock jumps, network delays); the two positions disagree about whether those assumptions are acceptable. The conservative engineering conclusion that does not require picking a side: if correctness depends on mutual exclusion, make the protected resource enforce it with a fencing token (a monotonically increasing number, issued with the lock, that the resource checks and rejects if it has seen a higher one), and treat Redis locks as an efficiency optimization, not a safety mechanism. `INCR` on a key can serve as the token source, with the caveat that it too can regress after failover.
+
+## Monitoring and alerting
+
+Most of what is needed is in `INFO`. The fields that map to the failure modes above:
+
+| Section | Field | Alert when |
+| --- | --- | --- |
+| persistence | `rdb_last_bgsave_status` | not `ok`; writes may be refused when `stop-writes-on-bgsave-error` is on |
+| persistence | `aof_last_write_status`, `aof_last_bgrewrite_status` | not `ok` (disk full, permission, I/O error) |
+| persistence | `aof_delayed_fsync` | increases (fsync lagging behind) |
+| persistence | `rdb_changes_since_last_save` | grows for longer than your tolerated RDB loss window |
+| stats | `latest_fork_usec` | trending up with dataset size |
+| replication | `master_repl_offset` against replica offset, `connected_slaves` | lag in bytes growing or replica count below expectation |
+| stats | `sync_full`, `sync_partial_err` | full resyncs repeating (backlog too small) |
+| memory | `used_memory` against `maxmemory`, `mem_fragmentation_ratio` | above a headroom threshold; fragmentation persistently high |
+| stats | `evicted_keys`, `rejected_connections`, `expired_keys` | any eviction on an instance that holds durable data |
+| clients | `blocked_clients`, client output buffer memory (`CLIENT LIST` `omem`) | sustained growth on pub/sub clients |
+
+For latency, `CONFIG SET latency-monitor-threshold 100` (milliseconds) enables the latency monitor, after which `LATENCY LATEST`, `LATENCY HISTORY` and `LATENCY DOCTOR` identify events such as `fork`, `aof-fsync-always` and `expire-cycle`. `SLOWLOG GET 10` lists commands that exceeded `slowlog-log-slower-than` (10,000 microseconds by default, 128 entries retained). The slowlog records execution time only, excluding network and queueing, so it will not show a stall caused by the fork or by other clients.
+
+For streams, track `lag` from `XINFO GROUPS` (7.0+), the pending count and the oldest pending entry's idle time from `XPENDING`, and the stream length against the trim target. A growing `lag` with a stable pending count means consumers are too slow; a growing pending count with an old idle time means consumers are failing or stuck. For a list queue, `LLEN` and the age of the oldest item (store an enqueue timestamp in the payload).
+
+## Security considerations
+
+A Redis instance is a powerful remote execution surface if reachable. Several controls, in order of importance:
+
+- **Do not expose it to the internet or to untrusted networks.** Bind to private interfaces (`bind`), keep `protected-mode yes` (the default since 3.2, it refuses non-loopback connections when no password or ACL is configured), and restrict by firewall or security group. Exposed unauthenticated instances have been abused for years, including through `CONFIG SET dir` and `CONFIG SET dbfilename` followed by a save to write files in places the process can reach.
+- **Use ACLs (6.0+)** rather than a single shared password. Create a user per application with only the commands, key patterns and, from 6.2, pub/sub channel patterns it needs; in 7.0 the default for channels is none (`acl-pubsub-default resetchannels`), so a user that subscribes needs explicit `&channel` rules. Disable or restrict the `default` user.
+- **Use TLS (6.0+)** with `tls-port` (and, if wanted, `port 0`) for traffic that crosses hosts, and mutual TLS where the client certificates can be managed.
+- **Limit dangerous commands**: `FLUSHALL`, `FLUSHDB`, `KEYS`, `CONFIG`, `DEBUG`, `SHUTDOWN`, `MODULE`, `SLAVEOF`/`REPLICAOF`. ACL categories (`-@dangerous`) do this properly; `rename-command` still works but is a blunt tool that complicates tooling and replication, and ACLs are preferred in 6.0 and later.
+
+```text
+# title: ACL for a queue worker (illustrative)
+ACL SETUSER billing-worker on >CHANGE-ME-USE-A-SECRET-STORE ~orders ~orders:* resetchannels +xreadgroup +xack +xautoclaim +xpending +xadd +xinfo +ping
+ACL SETUSER default off
+```
+
+## Failure scenarios walk-through
+
+Each scenario below states the setup, what Redis does, what the client sees, and the mitigation.
+
+**1. Master process killed, AOF `everysec`, no replica.** The restart replays the AOF. The writes since the last fsync (typically about a second) are missing if the host also failed; if only the process died, the page cache survives and little or nothing is lost. A producer that was told "OK" for a lost write is not told otherwise. Mitigation: `always` or `WAITAOF` for important writes, and producers that can re-send with idempotency.
+
+**2. Master partitioned, replica promoted by Sentinel.** The old master keeps accepting writes from clients on its side until the partition ends, and those writes are discarded when it resyncs as a replica. Mitigation: `min-replicas-to-write` and `min-replicas-max-lag` so an isolated master stops accepting writes, with the accepted cost that it then rejects them; `WAIT` for critical writes.
+
+**3. Disk full or I/O error on the AOF.** `aof_last_write_status` becomes `err`. With `appendfsync always` a failed write is fatal to the process, because Redis cannot honour the durability it promised; with the other policies, recent versions reject writes until the error clears. A failed background save with `stop-writes-on-bgsave-error yes` returns a `MISCONF` error to writers. These are loud failures that stop producers, which is the correct behavior; alert on the status fields before capacity runs out.
+
+**4. Fork fails or causes a latency spike.** The child cannot be created if overcommit is disabled and memory is tight, or the parent is paused for the page-table copy on a large instance, visible as `latest_fork_usec` and the latency monitor's `fork` event. Mitigation: `vm.overcommit_memory=1`, THP off, memory headroom, schedule rewrites, keep instances moderate in size (shard rather than grow).
+
+**5. Consumer crashes mid-job.** The entry stays in the PEL with a rising idle time. A reaper using `XAUTOCLAIM` reassigns it, delivery count increments, and the job reruns. Mitigation: idempotent handlers, a delivery-count threshold that moves the entry to a dead-letter stream, and an alert on the oldest pending idle time.
+
+**6. Producers outrun consumers.** The stream grows toward `maxmemory`. With `MAXLEN ~` trimming the stream silently drops the oldest entries, including unread ones; without trimming, memory fills and `noeviction` starts returning `OOM` to producers. Choose which you want: data loss or back-pressure. For work that must not be lost, prefer back-pressure: do not trim past the slowest group's position, and make producers handle the error or slow down.
+
+**7. Slow Pub/Sub subscriber.** Its output buffer crosses the limit and Redis closes the connection. The subscriber reconnects and has missed whatever was published meanwhile. Mitigation: do not use Pub/Sub for anything that must be seen, or add a sequence number and a catch-up read from a store.
+
+**8. Memory pressure with the wrong policy.** On an instance with `allkeys-lru` that also holds a stream or list, the queue is evicted as soon as it is the least recently used key. No error appears; the work is gone. Mitigation: separate instances by data class and `noeviction` for the durable one.
+
+## Assumptions and limitations
+
+<Callout type="assumption" title="What this article does not claim">
+
+No benchmark or throughput figure is given or implied; Redis performance depends on command mix, payload size, hardware, pipelining, persistence settings and client behavior, and must be measured for a given workload. Defaults and behaviors are stated for open-source Redis 7.x with differences noted, and may differ in forks and managed offerings, in versions after 7.2, and in specific minor releases. Code is a sketch: error handling, shutdown, retry limits and observability are reduced to keep it readable. The labs are simplified models of the semantics, not emulators. Sentinel and Cluster failover details are summarized and omit election timing, configuration epochs and edge cases that matter in a real incident review.
+
+</Callout>
+
+## Conclusion
+
+Redis is not one durability or delivery model; it is a set of mechanisms with different ones. Persistence gives node-level durability whose loss window you choose with `appendfsync`; replication gives availability but not a guarantee that acknowledged writes survive failover; Pub/Sub gives at-most-once delivery with no memory; lists give a queue that loses work unless you build the reliability yourself; Streams give an in-memory log with consumer groups, a pending list and at-least-once delivery that you must complement with idempotent handlers, a dead-letter step and trimming policy. Use `noeviction` for anything durable, alert on persistence status and consumer lag, keep instances out of the reach of untrusted networks, and move to Kafka when retention, replay and fan-out are what the system is really about.

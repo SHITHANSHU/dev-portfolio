@@ -1,0 +1,147 @@
+---
+title: "Kafka as a Distributed Log: Partitions, Replication, Consumer Groups and Replay"
+description: "A systems-level guide to Kafka topics, partition ordering, producer acknowledgements, replication, consumer offsets, retention and replay, with interactive partition and consumer-group playgrounds."
+date: "2026-11-11"
+status: "published"
+category: "Streaming Systems"
+tags: ["Kafka", "Distributed Systems", "Event Streaming", "Consumer Groups"]
+featured: false
+series: "Article 06"
+related: ["iot-mqtt-kafka-ksqldb-mongodb", "cdc-mysql-debezium-kafka-elasticsearch"]
+---
+
+## Start with the log, not the broker
+
+Kafka is easiest to reason about as a distributed, append-only log. Producers append records to named topics. A topic is split into partitions; each partition has its own ordered sequence of records. Consumers read from positions in those sequences and store progress as offsets. Brokers replicate partitions so a node failure does not necessarily make the log unavailable.
+
+This model gives Kafka a particular shape. A consumer can stop and resume, another consumer group can read the same retained records independently, and a slow sink can fall behind without blocking the producer immediately. But order is scoped to a partition, replay is bounded by retention, and consumer progress is only as safe as the point at which offsets are committed.
+
+This article uses Apache Kafka 4.2 documentation as the current reference for version-sensitive configuration. Core concepts apply across recent Kafka releases; defaults and APIs should be checked against the exact broker and client version. The examples are illustrative and make no performance claims.
+
+## The main data path
+
+A Kafka record has a key, value, timestamp and optional headers. The key often carries the entity identity whose updates must remain ordered. The value carries the event or state change. Producers choose a topic and may choose a partition explicitly; otherwise the producer's partitioner uses the key or a keyless strategy to select one.
+
+<Figure label="Fig 1" caption="A topic is a set of independently ordered partition logs. A consumer group assigns partitions to members and stores its read progress separately from the records themselves.">
+<FlowDiagram title="Kafka topic to consumer group" steps={[{label:"Producer",sub:"key + value + topic"},{label:"Topic",sub:"partitioner chooses P0…Pn"},{label:"Partition leader",sub:"append at offset",tone:"store"},{label:"Replica set",sub:"followers copy log"},{label:"Consumer group",sub:"one member per partition"},{label:"Offset commit",sub:"resume position",tone:"warn"}]} />
+</Figure>
+
+Kafka is not a queue where a successful read removes the item. Reading advances a consumer's position; records stay available until retention or compaction removes them. This is why two different consumer groups can independently build two projections from the same topic, while members of one group divide the partitions between themselves.
+
+## Partitions define ordering and parallelism
+
+Every record in a partition has an offset. Offsets increase as records are appended, and a consumer reads a partition in offset order. There is no global order across all partitions. If an application needs all changes for a customer or order to be observed in order, it should consistently key those records by that entity so they map to one partition.
+
+That key also defines a scaling boundary. All records for a hot key remain in one partition, so adding more consumers cannot parallelize that key without relaxing ordering. A topic with many partitions can distribute many independent keys, but each additional partition also adds metadata, file and replication work. Choose partition count from expected throughput and consumer concurrency, with room for growth, rather than treating partition creation as free.
+
+Increasing a topic's partition count can change the default key-to-partition mapping for new records. Older records for a key remain where they were written while newer ones may go to a different partition. If consumers process both partitions concurrently, the application can observe newer state before older state. Drain before changing counts or add a version/sequence check at the destination when order across the transition matters.
+
+The partition explorer shows the key-placement and assignment trade-offs. It uses a deterministic substitute hash so it can explain the shape of the mapping without pretending to reproduce a particular client's partitioner byte for byte.
+
+<KafkaPartitionExplorer />
+
+Try one consumer per partition, then raise the consumer count above the partition count. Extra members in the same group have nothing to own. Reducing the number of consumers makes each active member own multiple partitions; it does not merge the logs or create cross-partition ordering.
+
+### A key is a contract
+
+Keys are not just a distribution knob. They influence ordering, compaction and downstream joins. A good key is stable, well-distributed across the expected workload, and aligned with the smallest entity whose events must stay ordered. A key that is too coarse creates hot partitions. A key that changes during an entity's lifecycle scatters that entity across partitions.
+
+For compacted topics, the key is the identity of the latest-value record. For stream processing joins, the key often needs to match across the topics being joined. Changing a key schema can therefore be a data migration, not a harmless serialization change.
+
+## Replication and producer acknowledgements
+
+Each partition has a leader replica that handles reads and writes, plus follower replicas that fetch the leader's log. Kafka tracks replicas that are sufficiently caught up in the in-sync replica set (ISR). If a leader fails, an eligible replica can become the new leader. Replica placement and the number of available ISR members determine both fault tolerance and whether writes can continue.
+
+Producer acknowledgement settings choose how much confirmation the producer waits for:
+
+- `acks=0`: the producer does not wait for a broker response. It cannot know whether a record reached Kafka.
+- `acks=1`: the partition leader acknowledges after its local append. A leader failure before followers copy the record can lose it.
+- `acks=all` (also spelled `-1`): the leader waits for the current ISR to acknowledge. The `min.insync.replicas` setting can reject writes when too few replicas are in sync.
+
+For example, replication factor 3 with `min.insync.replicas=2` and `acks=all` can accept writes with two in-sync replicas, but rejects writes if the ISR falls below two. It does not require all three configured replicas to be online at every moment. This is a deliberate availability versus durability boundary; a rejected produce request needs a retry or an explicit failure path.
+
+```java
+// Illustrative Java producer reliability settings.
+props.put("acks", "all");
+props.put("enable.idempotence", true);
+
+// Topic policy, configured administratively rather than as producer properties:
+// replication.factor=3
+// min.insync.replicas=2
+```
+
+Idempotent producers use producer IDs and sequence numbers to deduplicate retries within the producer protocol. They prevent one class of duplicate caused by retrying an ambiguous send. They do not make an arbitrary application workflow exactly once, and they do not deduplicate two separate logical publish calls. Kafka's [producer configuration guide](https://kafka.apache.org/42/configuration/producer-configs/) describes the constraints and transaction settings.
+
+## Consumer groups, positions and committed offsets
+
+A consumer group's members share work by partition. For a given group, a partition is assigned to at most one member at a time. If there are fewer members than partitions, some members own several partitions. If there are more members, the excess members are idle. A membership change can cause a rebalance that revokes and assigns partitions; processing code must expect ownership to change.
+
+For each partition, a consumer has a current position: the next offset it will return. Separately, the group has a committed offset: the next offset from which the group should resume after a restart or reassignment. The group coordinator stores committed offsets in Kafka's internal offsets topic. That separation creates the processing/commit gap:
+
+1. The consumer receives offset 42 and performs a side effect.
+2. The consumer crashes before committing offset 43.
+3. After recovery, the group resumes at 42 and can perform the side effect again.
+
+This is normal at-least-once behavior. Commit after the side effect succeeds, and make that side effect idempotent where possible. Committing before the side effect instead risks skipping work if the process dies after the commit but before processing completes. For batch processing, commit only the next offset after the last contiguous record successfully processed in each partition; parallel work inside one partition needs explicit completion tracking.
+
+<KafkaConsumerGroupPlayground />
+
+The lab starts with synthetic records in four partitions. Increase produce rate above processing capacity to grow the backlog. In manual mode, process records without committing and trigger recovery: the group returns to its committed positions, so uncommitted records may be seen again. Replay resets this group's offsets without deleting the topic data.
+
+The simulation treats committed offset as the next record to read and defines lag as log-end offset minus committed offset. In real systems, dashboards may report consumer-position lag or committed-offset lag; both are useful, but answer slightly different questions. Kafka's [consumer-group operations guide](https://kafka.apache.org/42/operations/basic-kafka-operations/#checking-consumer-position) shows how to inspect current offsets, log ends and lag per partition.
+
+### Processing guarantees and transactions
+
+An offset commit and an external database write are separate operations unless the destination participates in Kafka's transaction protocol. A consumer that writes to SQL and then commits Kafka offsets can repeat the SQL write after a crash; a consumer that commits first can lose the write. Use destination-side idempotency, an inbox/outbox pattern, or a coordinated transaction where the system supports one.
+
+Kafka transactions can atomically write records to multiple Kafka partitions and commit the consumed offsets as part of the same transaction. A downstream consumer using `read_committed` avoids seeing aborted transactional records. That gives exactly-once processing semantics for a Kafka-to-Kafka flow when configured correctly. It does not automatically make a side effect in Elasticsearch, MongoDB, email or an HTTP API exactly once. State the boundary whenever using the phrase “exactly once.”
+
+## Retention, replay and compaction
+
+Kafka's default topic cleanup policy is time/size-based deletion, but topics can use compaction or both policies. With deletion, old log segments are removed after the configured retention boundary. Retention is not a promise to keep every record forever; a consumer that is offline longer than the retention window can fall behind the earliest available offset and need a reset, restore or rebuild strategy.
+
+With `cleanup.policy=compact`, Kafka retains the latest known value for each key as the cleaner processes eligible log segments. Compaction is asynchronous. It does not make the log a simple map at every instant: older values can remain until cleaning catches up, offsets do not renumber when records are removed, and delete tombstones are retained for a configured period before removal. A compacted topic is useful for rebuilding keyed state, not for audit history unless paired with a separate immutable event log.
+
+Replay is consumer-group state management. Starting a new group at the earliest retained offset rebuilds a projection from history; resetting an existing group's offsets changes its future reads and can repeat side effects. Replay plans need bounded retention, output idempotency, capacity to catch up, and a clear way to isolate a rebuild from live traffic.
+
+## Backpressure, lag and operations
+
+Kafka's log absorbs a mismatch between producers and consumers only while disk and retention capacity remain. If a sink processes more slowly than data arrives, lag grows. Consumers can catch up later if their sustained processing rate exceeds the incoming rate and retained data is still available. Adding consumer instances helps only when there are unassigned partitions and the destination can absorb the added concurrency.
+
+Monitor more than total group lag:
+
+- **Lag per partition and oldest record age.** A single hot partition can violate a freshness target while aggregate lag looks healthy.
+- **Consumer position versus committed offset.** A large gap can mean a long processing batch or delayed commits; it is different from unread log backlog.
+- **Rebalances and assignment changes.** Frequent rebalances interrupt progress and can amplify duplicate processing.
+- **Under-replicated and offline partitions.** These indicate replication health and availability risk.
+- **Produce errors, retries, request latency and throttling.** Distinguish broker acceptance issues from consumer-side slowness.
+- **Disk use, retention headroom and compaction backlog.** Lag near the log start offset is a recovery risk, not just a performance issue.
+
+Capacity estimates should keep units explicit. If a topic receives `r` records per second at an average compressed record size `s` bytes and retains data for `d` seconds, a rough single-copy payload estimate is `r × s × d`. Replication multiplies broker storage; indexes, segment overhead, batch compression, compaction and filesystem headroom add more. This is a planning lower bound, not a benchmark or a complete disk estimate.
+
+## Where Kafka fits—and where it does not
+
+Kafka fits when a team needs a retained event log, multiple independent readers, replay, partitioned parallelism, or a durable integration boundary between producers and several downstream systems. It asks the team to operate brokers, partitions, replication, schemas, consumer groups and retention policies.
+
+A task queue with per-message priority, short visibility timeouts and small delay intervals may be easier to express in RabbitMQ. A point-in-time delayed action may need a scheduler. A database can be simpler when the only requirement is durable state and transactional queries. Kafka's value comes from the log and the ecosystem around it; deploying a cluster does not remove the need to design idempotency, deadlines and failure recovery.
+
+| Requirement | Kafka concept | Design cost |
+| --- | --- | --- |
+| Order related events | Stable key → one partition | A hot key serializes its work |
+| Scale consumers | More partitions and group members | Parallelism cannot exceed assigned partitions |
+| Recover after consumer failure | Committed group offsets | Uncommitted effects can repeat |
+| Multiple independent read models | Separate consumer groups | Each group needs its own lag and retention plan |
+| Rebuild derived state | Replay retained log | Catch-up capacity and idempotent output |
+| Latest value per key | Compacted topic | Compaction is asynchronous, not immediate deletion |
+
+## Assumptions and limitations
+
+<Callout type="assumption" title="Scope">
+
+This is a design guide for Apache Kafka 4.2 concepts, with version-sensitive claims called out. Interactive labs are deterministic, synthetic models; they do not connect to a broker or emulate its protocol, timing, partitioner bytes, rebalancing algorithm or transaction coordinator. The partition explorer uses a substitute hash. The consumer playground uses four partitions and a simplified assignment. No performance figures are claimed.
+
+</Callout>
+
+## Conclusion
+
+Kafka's core abstraction is a set of partitioned logs with independent consumer progress. Keys define the ordering boundary; replicas define which failures a partition can tolerate; offsets define where a group resumes; retention defines how far back it can replay. The useful engineering question is not whether Kafka is “fast” or “exactly once,” but which event history must remain available, which keys must stay ordered, how much lag can be tolerated, and what the application does when a committed position and a side effect disagree.

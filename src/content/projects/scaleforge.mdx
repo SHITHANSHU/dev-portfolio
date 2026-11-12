@@ -1,0 +1,153 @@
+---
+title: ScaleForge
+summary: A browser-only lab for backend architecture. Drop components on a canvas, drive seeded traffic through a deterministic flow engine, inject failures, and grade the design against hidden scenarios.
+status: implemented
+statusNote: Source, docs and tests exist locally. Test results were not re-run for this page, nothing is deployed, and there is no public repository or license file yet.
+category: Developer tools / simulation
+tags: [system design, simulation, TypeScript, React, Web Worker, deterministic testing, education]
+year: "2026"
+order: 1
+featured: true
+links: []
+facts:
+  - { label: "Stack", value: "TypeScript, React 18, Vite, React Flow, Zustand, Zod, uPlot, Tailwind v4, pnpm workspaces" }
+  - { label: "Engine", value: "Dependency-free TypeScript package, consumed as source, runs in a Web Worker" }
+  - { label: "Components", value: "19 simulated component kinds (Kafka, Redis, Postgres, load balancer, CDN and others)" }
+  - { label: "Challenges", value: "7 guided, 10 open-ended, each open one with reference, must-pass and must-fail designs" }
+  - { label: "Tests", value: "About 117 it/test lines by static grep (parametrized cases make the real count higher); the project's own plan claims 245. Not re-run." }
+  - { label: "Size", value: "About 9.2k lines of TypeScript and TSX, excluding dependencies and build output" }
+  - { label: "Decision log", value: "24 ADR-style entries in docs/decisions.md" }
+---
+
+## Problem and context
+
+Backend system design is usually taught with boxes and arrows on a whiteboard. The boxes never fail, the arrows never saturate, and nobody checks whether the design survives a retry storm or a lost region. ScaleForge is an attempt to make the diagram executable: you place components, wire them, choose a traffic profile and a seed, then watch queues fill, caches go cold and error rates climb.
+
+The audience is mid to senior backend engineers. The project's plan states three principles that shaped everything else:
+
+1. Simulate behavior, not software.
+2. Run real algorithms where they are cheap (Bloom filter, LRU, LFU, consistent hashing, token bucket).
+3. Treat assumptions as data: editable, sourced, and labelled approximate.
+
+The plan is also blunt about its limits. These are teaching models, not production predictors.
+
+## Why it exists
+
+I wanted a place to build intuition for failure modes that are hard to reproduce on demand: consumer lag behind a hot partition, the database melting after a cache is flushed, a retry storm amplifying an outage. A real cluster makes those expensive. A model that is honest about what it leaves out makes them cheap and repeatable, and a seeded model makes them gradable.
+
+## Architecture overview
+
+The engine is a pure TypeScript package with no runtime dependencies. The web app owns the UI and runs the engine in a Web Worker so a long run never blocks the canvas. Challenges are plain JSON data read by the app, by the engine tests, and by lint tools.
+
+<Figure label="Fig. 1" caption="Layers as they exist in the repository. The engine never imports UI code; challenges are data shared by the app, the tests and the lint tools.">
+<FlowDiagram
+  title="ScaleForge layers"
+  steps={[
+    { label: "Design + scenario", sub: "nodes, edges, traffic profile, duration, seed, faults", tone: "store" },
+    { label: "Engine", sub: "fixed-tick flow simulation, seeded RNG", tone: "default" },
+    { label: "Web Worker", sub: "runs the sim, posts snapshots", tone: "default" },
+    { label: "React UI", sub: "canvas overlays, charts, event timeline", tone: "default" },
+  ]}
+/>
+</Figure>
+
+A run takes a design (a graph as JSON) plus a scenario and advances a fixed tick, 10 ms by default per the plan. Each tick produces a snapshot: global p50/p95/p99, error rate, throughput, retry rate, duplicate rate, cost per hour, per-node metrics, per-edge rate and latency, which nodes are down, and an event list. The worker posts snapshots to the UI.
+
+Every component is one folder: defaults, `fields` metadata (the inspector renders itself from this), `init`, `tick` and `sample` functions, typed ports, declared metrics and faults, versioned presets, and docs. A contract checker in `core/contract.ts` validates the shape, and registering a component is one line in an index file.
+
+## Technology choices
+
+- **TypeScript monorepo (pnpm workspaces).** The engine is consumed as source with no build step, which keeps the loop between a component edit and a test run short.
+- **Zero-dependency engine.** Purity is enforced by lint rather than convention. A component that calls `Math.random` or reads the wall clock would break replay, so CONTRIBUTING forbids both.
+- **Web Worker with Comlink.** Simulation is CPU-bound and must not share a thread with drag-and-drop on a 50-node canvas.
+- **React Flow, Zustand, Zod, Dexie, lz-string.** Canvas, state, schema validation for saved designs, local persistence, and share-by-URL-hash.
+- **Docs generated from registry metadata** instead of a separate docs site (ADR 14). A new component gets its documentation page for free.
+
+## Design decisions and trade-offs
+
+The decision log is the most useful artifact in the repo, so this section follows it. Numbers refer to entries in `docs/decisions.md`.
+
+**Flow, not messages (ADR 1).** Items carry a count, a mean latency and a read fraction, never an identity. That is what lets 50-node graphs run far faster than real time. The cost is that anything per-request has to be analytic or sampled: the Redis hit ratio is Zipf coverage times a policy factor times a TTL factor times warmth (ADR 6), and real LRU and LFU only run in a dedicated eviction lab.
+
+**One tick of delay per edge (ADR 2).** Each edge hands flow to the next tick. Cycles then work and node evaluation order stops mattering, which removes a whole class of ordering bugs. The price is a small amount of latency that is not in the latency sum.
+
+**Failure feedback flows upstream, one tick later (ADR 15).** Drops, kills and timeouts are reported to the edges that fed the failing node. Async boundaries (Kafka, RabbitMQ, Debezium) stop the propagation. A component that handles failure itself returns `recovered`, which removes those failures from user-visible errors. This is what lets retry storms and fail-open behavior look like the real thing.
+
+**A dead end is an error (ADR 16).** Early on, a design that connected nothing scored perfectly, because flow leaving an unconnected port simply vanished. Now only hidden terminal ports and declared sinks complete a request. It is a small rule that closes a large exploit.
+
+**Exactly-once is never claimed (ADR 18).** A duplicate fraction rides along with the flow. Timeouts followed by retries create duplicates, and an idempotency store absorbs them inside its window. The model only supports "effectively once at a boundary".
+
+**Latency is a per-tick flow mean (ADR 23).** Percentiles are computed over volume-weighted per-tick means, so true tail latency is understated. This is documented as a known limitation rather than hidden.
+
+**Determinism as a grading primitive (ADRs 21, 24).** Grading is in-browser and uses worst-case over the judged window, so a transient spike fails a criterion. Scenarios have public and hidden variants, hard criteria gate passing, soft criteria give partial credit, and a scenario is invalid if less than 40 percent of offered traffic completes end to end, so parked or discarded work cannot look healthy.
+
+<Callout type="note" title="Where the model is deliberately thin">
+Open-loop load only (ADR 3): there are no closed-loop users or think time. Presets are approximate and cite sources. Per-component pricing is a gameplay constraint, not a quote. These limits are written into the ADRs and, where relevant, the in-app docs.
+</Callout>
+
+## Engineering challenges
+
+**Keeping a flow model from lying.** Flow models are easy to exploit and easy to mislead. Beyond the dead-end rule above, replicated-database loss on async promotion is modelled as the unshipped log (ship lag times write rate), not the apply backlog (ADR 19), because the two behave differently and the second would give the wrong answer.
+
+**Grading that can be trusted.** An open-ended challenge is only fair if good alternative designs pass and plausible-but-flawed designs fail. The repository handles this with data: each open challenge carries a reference design, several `alt-*` designs that must pass, and `attempt-*` designs that must fail. Lint tools check that references pass, attempts fail, solutions do not leak into the player-facing text, and results reproduce.
+
+**Fault domains.** Regions are boundaries on the canvas (ADR 17). Killing a region takes down its components unless a component declares it spans regions, and cross-region edges add round-trip time. Failover is each component's job, not a hidden control plane, which keeps the engine honest about what it does not know.
+
+## Implementation details
+
+The component contract, reduced to the idea (illustrative, not the real file):
+
+```ts
+// title: component contract, simplified
+export interface ComponentKind<State, Cfg> {
+  kind: string;
+  defaults: Cfg;
+  fields: FieldMeta[];            // inspector renders from this
+  ports: { in: Port[]; out: Port[] };
+  init(cfg: Cfg, rng: Rng): State;
+  tick(s: State, inflow: Flow, ctx: TickCtx): { outflow: Flow; recovered?: number };
+  sample(s: State): Record<string, number>;
+}
+```
+
+Determinism comes from one rule: all randomness flows from a seeded generator passed in by the engine.
+
+```ts
+// title: seeded RNG, the whole idea
+export function makeRng(seed: number) {
+  let a = seed >>> 0;
+  return () => {              // mulberry32-style
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t ^= t + Math.imul(t ^ (t >>> 7), 61 | t);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+```
+
+The golden test runs four snapshot scenarios over the guided challenges and a 50-node performance budget that asserts at least 20 times real time. The ADR quotes roughly 330 times; the test only asserts the floor and logs the measured rate, so I treat 330 as an unreproduced claim until I run it again.
+
+## Implemented, in progress, planned
+
+| Evidence label | Items |
+|---|---|
+| Implemented | Flow engine and tick loop; 19 components; algorithms (Bloom, LRU, LFU, consistent hash, rendezvous, token bucket); failure feedback, retries, regions, duplicate tracking; canvas, inspector, scenario editor, charts; 7 guided and 10 open-ended challenges with deterministic grading; local persistence and file export; in-app docs from registry metadata |
+| In progress | GitHub Gist save and load is present in code but listed in the plan as unverified against live services. No other in-flight work is evidenced |
+| Planned | Columnar OLAP, object storage, time-series and lock-service components; leader election, gossip, vector clock and saga playgrounds; Playwright end-to-end tests; request-trace view; run comparison; a "find my ceiling" mode; closed-loop load; narrow-screen drawers and live-region announcements |
+
+Some plan items never shipped as written: separate docs, schema and presets packages were folded into the app and the component folders.
+
+## Lessons learned
+
+- **An ADR log pays for itself immediately.** Writing the limitation next to the decision (ADR 23 on tail latency is the clearest case) made it obvious which claims the UI could and could not make.
+- **Make cheating a test case.** The dead-end rule came from noticing that an empty design scored well. Every grading hole is cheaper to close with a must-fail design than with a rule in prose.
+- **Plans drift.** The plan, the synthesis doc and the disk disagree in small ways (nine versus ten open challenges; a mention of git history in a directory with no git repository). I trust the filesystem over the documents.
+- **Measure before quoting.** I have two performance numbers in the repo and only one has a test behind it.
+
+<Callout type="warning" title="Provenance">
+The local directory is not a git repository, so there is no commit history to cite. File timestamps cluster within roughly two and a half hours on a single day, and the build was driven by an agent prompt plus the plan. I treat the work as an agent-assisted build, specified and reviewed by me, and I do not claim anything about elapsed effort beyond that.
+</Callout>
+
+## What's next
+
+Run `pnpm check` and record the real test count. Reconcile the 245 versus about 117 figures. Add a CI workflow and a license. Verify Gist sharing against the live service. Then the highest-value product work: a request-trace view and run comparison, so a learner can see why one design beat another instead of only that it did. If a public demo ships, it will carry the honest-limits statement above the canvas.

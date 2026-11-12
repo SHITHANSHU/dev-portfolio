@@ -1,0 +1,627 @@
+---
+title: "Designing a Real-Time IoT Data Platform: MQTT, Kafka, ksqlDB and MongoDB"
+description: "How device telemetry travels from MQTT through Kafka and ksqlDB into MongoDB: QoS semantics, partitioning, event-time windows, time-series storage, and the failure modes in between."
+date: "2026-11-11"
+status: "published"
+category: "Streaming Systems"
+tags: ["MQTT", "Kafka", "ksqlDB", "MongoDB", "IoT"]
+featured: true
+series: "Article 02"
+related: ["cdc-mysql-debezium-kafka-elasticsearch", "ip-cameras-rtsp-video-streaming"]
+---
+
+## The problem: telemetry from unreliable edges
+
+A device fleet is a distributed system whose nodes have intermittent power, cellular links that drop for minutes, clocks that drift or reset to 1970 on boot, and firmware that was last updated in a different quarter than the backend. The platform on the other side has to answer two very different questions from the same stream of readings:
+
+- What is the state of device X right now? (a point lookup, latency measured in milliseconds)
+- What did fleet segment Y look like over the last week, and is it anomalous? (a range scan or aggregation over many devices)
+
+No single component serves both well, and no single component fits the transport requirements of the edge either. The architecture in this article splits the problem along those seams:
+
+- **MQTT** handles the device-facing edge: small constrained clients, flaky links, session state, and a publish/subscribe topic model.
+- **Kafka** is the durable, replayable, partitioned log that decouples ingestion from every consumer.
+- **ksqlDB** runs continuous queries over the log: filtering, enrichment, windowed aggregation.
+- **MongoDB** serves queries: a latest-state collection for point lookups and a time-series collection for history.
+
+The author has worked with this class of pipeline (Kafka, MQTT and ksqlDB for traffic analytics, MongoDB for storage). Everything below is written as a design discussion, not as a report of one deployment. Every number is either a protocol or product fact stated with its version dependency, or arithmetic labelled illustrative. Code is illustrative and not validated against a specific version unless stated otherwise.
+
+<Callout type="assumption" title="Scope and assumptions">
+
+The reference design assumes: devices speak MQTT over TLS to a clustered broker; one Kafka cluster with replication factor 3; ksqlDB in a small cluster reading Kafka topics; MongoDB 6.0 or newer (time-series collections exist from 5.0, but several features discussed here arrived later and are called out). Fleet sizes used below (10,000 to 100,000 devices) are arithmetic conveniences, not measurements.
+
+</Callout>
+
+## Architecture overview and responsibilities
+
+<Figure label="Fig 1" caption="Reference pipeline. Each arrow is a separate delivery guarantee with its own failure behavior.">
+<FlowDiagram title="Telemetry path" steps={[{label:"Devices",sub:"sensors, gateways"},{label:"MQTT broker",sub:"sessions, topics, ACLs",tone:"store"},{label:"Bridge",sub:"MQTT to Kafka"},{label:"Kafka",sub:"raw topic, partitioned",tone:"store"},{label:"ksqlDB",sub:"clean, window, aggregate"},{label:"Kafka",sub:"derived topics",tone:"store"},{label:"Sink",sub:"Kafka Connect or consumer"},{label:"MongoDB",sub:"state + time series",tone:"store"}]} />
+</Figure>
+
+The responsibilities, stated so that each is owned once:
+
+| Component | Owns | Explicitly does not own |
+| --- | --- | --- |
+| MQTT broker | Device sessions, authentication, topic ACLs, per-hop delivery (QoS), retained messages, last-will | Long-term storage, replay for new consumers, analytics |
+| Bridge | Mapping topics to Kafka topics and keys, acknowledging upstream only after downstream durability | Business logic, schema evolution |
+| Kafka | Durable ordered log per partition, retention, consumer groups, replay | Per-device sessions, fine-grained device auth |
+| ksqlDB | Stateful stream processing: cleaning, windowing, joins, derived topics | Serving user queries at scale, long-term history |
+| MongoDB | Query serving: latest state, historical range queries, retention by TTL | Being the system of record for raw events (Kafka retention plus an archive is) |
+
+The most common design error in this class of system is collapsing two of these roles: using the MQTT broker as a buffer for consumers that cannot keep up, or using MongoDB as the replay source. Brokers are optimized for fan-out of in-flight messages; Kafka is optimized for a log that can be re-read.
+
+## Device telemetry and connectivity
+
+Devices fall into three practical categories, which change the design:
+
+1. **Direct MQTT devices** (microcontrollers, modems) with a few KB of RAM and a TLS stack. They hold one long-lived TCP connection and reconnect after drops.
+2. **Gateways** that aggregate local sensors (BLE, Modbus, serial) and speak MQTT upstream. They multiplex many logical devices over one connection, so `clientId` identifies the gateway, not the sensor.
+3. **HTTP-only or batch devices**, which need a separate ingestion path. This article does not cover them.
+
+Three properties of the edge shape everything downstream:
+
+- **Connections are long-lived and links are lossy.** MQTT runs over TCP, so a healthy connection delivers in order without loss, but a dead connection can look alive for up to roughly 1.5 times the keep-alive interval (MQTT 3.1.1 specifies that the server should disconnect a client that is silent for 1.5 times the keep-alive period). Keep-alive is therefore your failure detection latency for silent drops.
+- **Device clocks are not trustworthy.** A device without an RTC may report epoch zero until NTP completes. The pipeline needs both a device-reported timestamp (event time) and an ingestion timestamp (broker or bridge receive time), and must define what happens when they disagree wildly.
+- **Reconnect storms happen.** After a regional outage thousands of devices reconnect at once. Without jittered exponential backoff on the device and connection rate limits on the broker, recovery itself becomes the next outage.
+
+## MQTT broker responsibilities and topic hierarchy
+
+An MQTT broker accepts client connections, authenticates them, matches published messages against subscriptions, and delivers them with the negotiated QoS. It also stores session state (subscriptions and unacknowledged QoS 1/2 messages) for clients that request persistent sessions, retains one last message per topic when flagged `retain`, and publishes a client's last-will message if the client disappears without a clean `DISCONNECT`.
+
+### Designing the topic tree
+
+Topic names are UTF-8 strings with `/` as a level separator, case sensitive, and matched with two wildcards available only in subscriptions: `+` for exactly one level and `#` for the remainder (it must be the last character). Topics beginning with `$` (such as `$SYS/...`) are reserved for broker use and are not matched by a leading wildcard.
+
+A hierarchy that has held up well in this kind of design puts stable, low-cardinality dimensions first and the device identity last:
+
+```text
+// title: illustrative topic scheme
+v1/{tenant}/{site}/{deviceType}/{deviceId}/telemetry
+v1/{tenant}/{site}/{deviceType}/{deviceId}/state        (retained)
+v1/{tenant}/{site}/{deviceType}/{deviceId}/status       (LWT: online/offline)
+v1/{tenant}/{site}/{deviceType}/{deviceId}/cmd/{name}   (downlink)
+```
+
+Design rules and the reasons behind them:
+
+- **Version the root** (`v1/`) so a breaking payload change can run in parallel on a new tree.
+- **Never put data in the topic that varies per message** (a timestamp, a reading). Topics are not free: brokers keep per-topic structures, especially for retained messages and some for subscription matching.
+- **Put the device ID in the topic and also in the payload.** The topic is what authorization sees; the payload is what survives after the bridge strips topic context. The bridge should verify they match, otherwise a compromised device can claim another device's identity inside the payload.
+- **Separate uplink from downlink** (`telemetry` versus `cmd`) so ACLs are simple: a device may publish to its own `telemetry`, `state` and `status` and subscribe only to its own `cmd/#`.
+- **Avoid wildcard-heavy subscriptions for the ingestion consumer.** The bridge subscribing to `v1/+/+/+/+/telemetry` is fine; hundreds of thousands of per-device subscriptions are not.
+
+Here is the whole pipeline running end to end with synthetic devices. Use the controls to change the fleet size and publish rate, start and pause the simulation, and click individual messages to inspect them as they pass each stage.
+
+<IotPipelineSimulator />
+
+Watch the per-stage counters rather than the animation. When you raise the publish rate, the stage whose counter diverges first from the one upstream of it is the bottleneck, and the gap between them is the in-flight backlog. That is exactly the quantity to alert on in a real deployment. The simulation is synthetic and illustrates flow and backpressure shape; it makes no claim about the throughput of any real broker or cluster.
+
+## MQTT QoS 0, 1 and 2: what is and is not guaranteed
+
+QoS is the most frequently misunderstood part of MQTT, so precision matters. Three rules cover most of the confusion:
+
+1. **QoS is per hop, not end to end.** The publisher's QoS governs the publisher-to-broker leg. A separate QoS, the subscription's granted QoS, governs the broker-to-subscriber leg. The delivered QoS is the lower of the two. If the bridge subscribes at QoS 1 while the device published at QoS 2, the broker-to-bridge leg is QoS 1.
+2. **QoS describes delivery of a message over a session, not application-level exactly-once processing.** What happens after the bridge receives a message (writing to Kafka) is outside MQTT's guarantee.
+3. **QoS 1 and 2 guarantees depend on session continuity.** If the session state is lost (a clean session, a session that expired, a broker that does not persist session state, or a failover without replicated session state), in-flight messages can be lost.
+
+| QoS | Name | Packet flow | Guarantee on that hop | Duplicates? | Loss? |
+| --- | --- | --- | --- | --- | --- |
+| 0 | At most once | PUBLISH | None beyond TCP; no acknowledgement | No | Possible (connection drop, broker discards) |
+| 1 | At least once | PUBLISH, PUBACK | Sender retains the message until PUBACK | Possible | Not while the session persists |
+| 2 | Exactly once (per hop, protocol level) | PUBLISH, PUBREC, PUBREL, PUBCOMP | Receiver delivers the message to the application once; handshake prevents duplication | No at the protocol level | Not while the session persists |
+
+<SequenceDiagram title="QoS 1 with a lost acknowledgement" actors={["Device","Broker"]} messages={[{from:"Device",to:"Broker",label:"PUBLISH QoS1",note:"packet id 7"},{from:"Broker",to:"Broker",label:"forward to subscribers"},{from:"Broker",to:"Device",label:"PUBACK 7 (lost)",dashed:true},{from:"Device",to:"Broker",label:"PUBLISH QoS1 DUP=1",note:"retransmit, packet id 7"},{from:"Broker",to:"Device",label:"PUBACK 7",dashed:true}]} />
+
+The scenario above is why QoS 1 is at-least-once: the broker already processed the first PUBLISH, but the sender cannot know that, so it must resend. The DUP flag is a hint, not a deduplication mechanism, and receivers must not rely on it to detect application-level duplicates. In MQTT 3.1.1 the retransmission is normally triggered by reconnect with a persistent session (the sender resends unacknowledged PUBLISH packets); MQTT 5 requires that retransmission occur only on reconnect, not on a timer, because TCP already provides in-connection reliability.
+
+QoS 2 adds a second handshake so that the receiver can remember the packet identifier after it has delivered the message:
+
+<SequenceDiagram title="QoS 2 four-part handshake" actors={["Sender","Receiver"]} messages={[{from:"Sender",to:"Receiver",label:"PUBLISH QoS2",note:"id 9; receiver stores id, delivers once"},{from:"Receiver",to:"Sender",label:"PUBREC 9",dashed:true},{from:"Sender",to:"Receiver",label:"PUBREL 9",note:"sender may now discard the message"},{from:"Receiver",to:"Sender",label:"PUBCOMP 9",dashed:true}]} />
+
+### What exactly-once means here and what it does not
+
+QoS 2 gives the receiving MQTT client or broker exactly-once handoff to its application for that hop, provided the session survives. It costs four packets instead of two per message and requires both sides to hold state per in-flight packet identifier (a 16-bit space, so at most 65,535 in-flight messages per direction per session, with MQTT 5 additionally allowing a lower Receive Maximum to bound it). It does not make the pipeline exactly-once, because:
+
+- The bridge crossing into Kafka is a different system with its own acknowledgement. A crash between receiving the MQTT message and the Kafka acknowledgement will either lose the message (if the bridge acked MQTT first) or duplicate it (if it acked after and the MQTT ack was lost).
+- The device may publish the same reading twice at the application level (a retry after a timeout at the application layer, a firmware bug).
+
+For most telemetry the practical choice is QoS 1 on the device uplink plus idempotent processing downstream: duplicates are cheap to tolerate, while the QoS 2 handshake costs latency, battery (radio time) and broker state on every message. QoS 0 is appropriate for high-rate, individually unimportant readings where the next reading supersedes the last (a temperature sample every few seconds), accepting loss during reconnects. QoS 2 is defensible mostly for commands that must not be applied twice, and even there an idempotency key in the command is the more robust design.
+
+The interactive below lets you choose a QoS level and inject faults: drop the PUBLISH, drop the acknowledgement, force a reconnect, and toggle whether the session is persistent. Try QoS 1 with a dropped PUBACK, then try the same fault with a non-persistent session.
+
+<MqttQosPlayground />
+
+You should see that QoS 1 produces a duplicate delivery in the dropped-acknowledgement case and QoS 0 silently produces nothing, and that QoS 2 suppresses the duplicate at the receiver. Then notice that the playground's application-level idempotency toggle is what makes the final stored result correct in every case. The protocol guarantee and the application guarantee are different layers, and the playground deliberately simplifies timers and broker internals.
+
+## MQTT 3.1.1 versus MQTT 5 in this pipeline
+
+Most brokers and client libraries in the field support both versions. For a new platform MQTT 5 is the better default if all device firmware can speak it, but a heterogeneous fleet frequently still contains 3.1.1 clients, and the broker must handle both. The differences that matter for this architecture:
+
+| Concern | MQTT 3.1.1 | MQTT 5 |
+| --- | --- | --- |
+| Session persistence | `cleanSession` flag: true discards state on disconnect, false keeps it until the broker decides to drop it (indefinite in the spec, bounded in practice by broker config) | `cleanStart` flag plus a Session Expiry Interval, so persistence has an explicit, per-client lifetime (0 means session ends at disconnect) |
+| Shared subscriptions | Not part of the standard; some brokers offer vendor extensions, with differing syntax | Standard: `$share/{group}/{topicFilter}`; messages are distributed across the group's members |
+| Error reporting | Many failures just close the connection; SUBACK has a single failure code | Reason codes on CONNACK, PUBACK, SUBACK, DISCONNECT and others |
+| Flow control | None beyond in-flight QoS limits implemented ad hoc | Receive Maximum bounds unacknowledged QoS 1/2 messages |
+| Message expiry | Not available | Message Expiry Interval: broker drops undelivered messages after the interval |
+| Metadata | Payload only | User properties, content type, payload format indicator, response topic and correlation data |
+| Topic length | Topic names repeated on every PUBLISH | Topic aliases replace a repeated topic string with a small integer on a given connection |
+| Authentication | Username/password in CONNECT | Adds enhanced authentication (challenge/response, for example SCRAM or token flows) via AUTH packets |
+| Server-initiated disconnect | Silent close | DISCONNECT with reason code (for example server shutting down, session taken over, quota exceeded) |
+
+### Shared subscriptions and why the bridge wants them
+
+A single bridge process subscribing to all telemetry is a throughput ceiling and a single point of failure. In MQTT 5, several bridge instances can subscribe to the same shared filter:
+
+```text
+// title: illustrative shared subscription (MQTT 5)
+$share/kafka-bridge/v1/+/+/+/+/telemetry
+```
+
+The broker delivers each matching message to one member of the `kafka-bridge` group, so adding instances scales ingestion horizontally and a dead instance's share goes to the others. Three details matter:
+
+- **Distribution is per message, not per device.** The broker does not guarantee that the same device's messages go to the same group member. Two consecutive readings from one device can reach two bridge instances and be produced to Kafka in a different order than they were published. The bridge must therefore key by device ID and tolerate that; per-device ordering in Kafka is then determined by producer arrival order, not device order, so downstream logic that needs device order must use a device sequence number or event time. The actual distribution strategy (round robin, random, hash, sticky) varies by broker.
+- **QoS interacts with the group.** If a member disconnects with unacknowledged QoS 1 messages, behavior (redelivery to another member, or waiting for the same client to return) is broker specific. Check it before you rely on it.
+- **Without MQTT 5 support**, brokers with vendor shared-subscription syntax can achieve the same thing, at the cost of portability. Alternatively, you can partition the topic tree across bridge instances by tenant or site.
+
+### Session expiry in practice
+
+For the bridge itself, a persistent session with a bounded Session Expiry Interval (for example, longer than your longest planned bridge outage, and no longer) is what makes QoS 1 backlog survive a restart without letting abandoned sessions accumulate forever. For devices, the choice is usually shorter: a sensor that publishes the latest reading every few seconds gains little from a queued backlog, and a backlog replayed after a long outage floods the pipeline with stale data. Setting a Message Expiry Interval on downlink commands and short session expiry on uplink-only devices bounds the damage. In 3.1.1 you achieve similar effect only through broker-side queue limits and TTL configuration, which are vendor specific.
+
+## Authentication, authorization, TLS and device identity
+
+The edge is the internet-facing attack surface of the platform, so the choices here are not optional hardening. They are part of the protocol design.
+
+- **Transport.** Terminate TLS 1.2 or newer at the broker (MQTT over TLS conventionally uses port 8883). Where devices can hold a private key, prefer mutual TLS so the broker authenticates the device by certificate, not a shared secret.
+- **Identity.** Give every device a unique identity: a per-device client certificate or per-device credential, never a fleet-wide shared password. Map the certificate subject (or a SAN) to a device ID in the broker, and use that mapped identity in ACL rules and for `clientId` enforcement. A fleet-wide secret turns one extracted firmware image into a fleet compromise.
+- **Authorization.** ACLs bind identity to topics using substitution, so one rule covers the fleet: the rule allows publish on `v1/${tenant}/${site}/+/${deviceId}/telemetry` and subscribe on `v1/${tenant}/${site}/+/${deviceId}/cmd/#` for the authenticated identity. The syntax of substitution is broker specific; the principle is that a device can write only its own subtree. Authorization on subscribe is as important as on publish, because a permissive `#` subscription leaks the whole fleet's data.
+- **Bridge credentials.** The bridge is a high-privilege client that reads all telemetry. Give it its own identity, restrict it to the uplink filters it needs, and keep its credentials in a secret manager, not in connector configuration committed to a repository.
+- **Provisioning and rotation.** Certificates expire. Plan issuance at manufacturing or first boot, rotation before expiry, and revocation (CRL or OCSP support varies by broker; short-lived certificates sidestep revocation at the price of a rotation workflow). Devices that cannot rotate need a documented end of life.
+- **Payload integrity vs. transport.** TLS protects the hop to the broker. If messages cross untrusted intermediaries or you need non-repudiation per message, sign the payload at the device. This is rare for telemetry and common for commands.
+- **Abuse limits.** Enforce maximum packet size, per-client message rate, and connection rate at the broker. A malfunctioning device that publishes in a loop is a denial-of-service source indistinguishable from an attack.
+
+## MQTT to Kafka: bridge patterns
+
+There are three ways to cross from MQTT into Kafka, with different failure behavior:
+
+1. **Kafka Connect source connector for MQTT.** An MQTT client runs inside a Connect worker, subscribes to topics and writes records to Kafka. Several implementations exist (commercial and open source); features, delivery semantics and licensing differ, so check the specific connector. Its advantage is operational uniformity with the rest of your Connect estate; its limitations are typically a single consumer per task and limited control over message ordering and acknowledgement timing.
+2. **Broker-native integration.** Several commercial and open-source brokers ship a rule engine or extension that forwards messages to Kafka directly, usually with topic mapping and key templates. This removes a hop and a deployment but ties your pipeline to the broker vendor.
+3. **A custom bridge.** A small service using an MQTT client and a Kafka producer. It costs maintenance but gives full control of the three things that matter: acknowledgement ordering, key selection, and validation at the boundary.
+
+Whichever you choose, the correctness property to demand is the **ack-after-durable-write** rule: the MQTT acknowledgement for a message (PUBACK on the broker-to-bridge leg) must not be sent until Kafka has acknowledged the write. In code, that means the producer callback completes before the MQTT client acks. Note that many MQTT client libraries ack QoS 1 automatically on receipt unless you use manual acknowledgement mode, which is exactly the setting to look for.
+
+```java
+// title: BridgeSketch.java (illustrative, not validated against a specific client version)
+// Manual-ack MQTT consumer: ack only after Kafka confirms durability.
+void onMessage(MqttMessage msg, Runnable ackMqtt) {
+    Envelope env = Envelope.parse(msg.topic(), msg.payload());
+    if (!env.isValid()) {                       // validate at the boundary
+        deadLetter(msg, "invalid");
+        ackMqtt.run();                          // poison messages must not block the queue
+        return;
+    }
+    ProducerRecord<String, byte[]> rec = new ProducerRecord<>(
+        "iot.telemetry.raw.v1",
+        null,                                   // let the partitioner pick from the key
+        env.deviceTsMillis(),                   // record timestamp = event time (see below)
+        env.deviceId(),                         // key = device id
+        env.canonicalBytes());
+    producer.send(rec, (md, ex) -> {
+        if (ex == null) ackMqtt.run();          // durable in Kafka, now ack upstream
+        else retryOrFail(msg, ex);              // leave unacked, MQTT will redeliver
+    });
+}
+```
+
+With ack-after-durable-write, the bridge converts a crash into a duplicate (the broker redelivers an unacked QoS 1 message) instead of a loss. That is the intended trade: at-least-once into Kafka, with deduplication handled downstream.
+
+Bridge back pressure deserves a mention. If Kafka is slow or unavailable, the bridge stops acking, the broker's in-flight window for the bridge fills (bounded by the MQTT 5 Receive Maximum or broker settings), and the broker begins queuing or dropping. Size broker queue limits deliberately and decide the overflow policy per use case; silent drops in the broker are invisible to Kafka-side monitoring.
+
+## Kafka: producers, keys, partitions and retention
+
+Kafka is the pipeline's system of record for in-flight and recent events. The decisions that determine correctness and scale are the key, the partition count, the producer acknowledgement settings, and retention.
+
+### Producer settings
+
+For telemetry that must not be silently lost once the bridge has acked MQTT:
+
+```properties
+# title: bridge producer (illustrative, not validated against a specific version)
+acks=all
+enable.idempotence=true
+max.in.flight.requests.per.connection=5
+compression.type=zstd
+linger.ms=20
+batch.size=131072
+delivery.timeout.ms=120000
+```
+
+`acks=all` waits for the in-sync replicas, and together with a topic-level `min.insync.replicas=2` (with replication factor 3) means a write is acknowledged only after at least two replicas have it, so one broker can fail without data loss. Idempotent producing (the default in clients from Kafka 3.0 onward, with `acks=all`) uses a producer ID and per-partition sequence numbers so that a retried send within one producer session does not write a duplicate and ordering is kept with up to five in-flight requests. It deduplicates retries by that producer session; it does not deduplicate a message the MQTT broker redelivered to a restarted bridge, because that is a new produce call. `linger.ms` and `batch.size` trade a little latency for larger batches, which matters more than most other settings for broker throughput.
+
+### Keys and partitions
+
+Ordering in Kafka is guaranteed only within a partition. The default partitioner for a record with a key hashes the key (murmur2) modulo the number of partitions, so all records for one key land in one partition and are read in order. For device telemetry the natural key is the device ID: per-device order is preserved, a stateful consumer can keep per-device state locally, and ksqlDB can group by key without a repartition.
+
+The cost of that choice is skew. If device traffic is uneven (a gateway that publishes for 500 sensors, a chatty firmware version, a tenant that is ten times larger), the partition holding the heavy key carries more load than the others. Since a partition is consumed by at most one consumer in a group, a hot partition caps parallelism and shows up as consumer lag on one partition while the others are idle. Options when skew is real:
+
+- **Key at finer granularity** (sensor ID rather than gateway ID) if per-gateway ordering is not required.
+- **Composite keys** that add a small bucket suffix to spread a known hot key, at the cost of losing total per-key ordering and complicating consumers.
+- **Increase partitions** helps spread many keys but cannot split a single key.
+- **Key by a different dimension** for consumers that do not need per-device order.
+
+The partition count is a decision that is hard to reverse. Increasing it later changes the key-to-partition mapping for new records, which breaks per-key ordering across the boundary and any co-partitioned joins; plan partitions for the growth horizon, bearing in mind that each partition adds replication, file-handle and recovery cost. A sizing rule: take the target throughput, divide by the throughput one consumer can process, and round up with headroom; then check that the result is not wildly more than the broker count times a few tens of partitions per broker.
+
+Try different key strategies against a synthetic fleet. Set the device count, partition count and key strategy (device ID, a coarser site-level key, or no key), and add a skewed device class.
+
+<IotPartitioningExplorer />
+
+With device ID keys on a uniform fleet the bars should be roughly even, and each device's messages stay in one partition. Switch to a site-level key or add a heavy-hitter class and one bar grows: that is a hot partition. Switch to no key and the distribution evens out but per-device ordering disappears. The explorer uses a simple deterministic hash rather than Kafka's exact murmur2 mapping, so it demonstrates distribution shape, not the actual partition assigned to a real key.
+
+Partition placement determines which consumer can read a record, but consumer progress is tracked separately for every partition. The Kafka playground below animates the next offset versus the committed offset. Increase the producer rate above processing capacity to grow lag; switch to manual commits, process records, then simulate a crash to see why records after the last commit can be delivered again.
+
+<KafkaConsumerGroupPlayground />
+
+The model treats offsets as the next record to read and reports lag against the committed offset. Real Kafka consumers can commit automatically or manually, and assignment and rebalance behavior depends on the consumer protocol and assignor. This simulation intentionally focuses on the processing-to-commit gap, not broker timing.
+
+### Retention and compaction
+
+Kafka retains data by time or size per topic (the broker default `log.retention.hours` is 168, seven days, but topics override it). Raw telemetry topics typically want a retention period set by the longest replay you need to support: if the sink can be down for two days and you want a safety margin for a bad deploy that needs reprocessing, a week is a reasonable starting point. Longer-term replay should come from an archive (object storage via a sink connector), not from ever-larger Kafka retention on expensive replicated disks. Tiered storage, available in newer Kafka versions and in some vendor distributions, changes that economics, and its maturity depends on the version.
+
+A different kind of topic, the latest-state topic (key = device ID, value = last known state), should use **log compaction** (`cleanup.policy=compact`) so Kafka retains at least the latest record per key regardless of age. This is what lets a new consumer bootstrap the current state of every device by reading a topic from the start. Compaction is not immediate and does not remove records from the active segment, so it is not a deduplication or deletion guarantee at read time.
+
+## Event schemas and serialization
+
+An unversioned JSON blob per device is where pipelines go to rot. The minimum viable contract is an envelope that separates identity and time from the measurement payload:
+
+```json
+{
+  "schemaVersion": 2,
+  "deviceId": "dev-000417",
+  "msgId": "dev-000417-1731312000-0042",
+  "seq": 42,
+  "ts": "2026-11-11T08:00:00.000Z",
+  "fw": "1.8.3",
+  "metrics": { "temperature_c": 21.4, "humidity_pct": 48.2, "battery_v": 3.71 }
+}
+```
+
+This payload is synthetic and illustrative. The fields worth having in any such contract:
+
+- `deviceId` and a per-device monotonically increasing `seq` (or a device-generated `msgId`): these enable deduplication downstream and gap detection (a jump in `seq` means loss; a repeated `seq` means duplicate or replay). The sequence survives reboots only if the device persists it, so some designs include a boot counter.
+- `ts`: the device's event time, in UTC, in a fixed format. Pair it with an ingestion timestamp stamped by the bridge so that a skewed device clock is detectable (`ingestTs - ts` far outside plausible latency).
+- `schemaVersion`: so consumers can branch and so evolution is deliberate.
+
+**Serialization choices.** JSON is easy to debug and bigger on the wire; devices on metered cellular links may prefer CBOR, MessagePack or Protocol Buffers on the MQTT leg. Between the bridge and everything downstream, a schema-registry-backed binary format (Avro, Protobuf or JSON Schema) is the usual choice: it enforces compatibility rules (backward, forward or full, configured per subject) at produce time, shrinks messages, and gives ksqlDB a schema it can read directly. The bridge is the right place to translate: accept whatever the device sends, validate, and emit one canonical format to Kafka. Invalid messages go to a dead-letter topic with the reason, not into the main topic and not into the void.
+
+Evolution rules that avoid pain: add optional fields with defaults; never change a field's type or meaning in place; version the topic (`...raw.v2`) for breaking changes and run both during migration; keep units explicit in field names (`temperature_c`) because a firmware that switches to Fahrenheit silently is a real failure mode.
+
+## ksqlDB streams, tables, windows and aggregations
+
+ksqlDB is a SQL interface over Kafka Streams. It offers two abstractions that map directly to Kafka's two usage patterns:
+
+- A **stream** is an unbounded sequence of immutable events (every reading is a row).
+- A **table** is a changelog view: the latest value per key (the current state of each device), updated as new records arrive.
+
+```sql
+-- title: streams and tables (illustrative, not validated against a specific ksqlDB version)
+CREATE STREAM telemetry_raw (
+  deviceId   VARCHAR KEY,
+  seq        BIGINT,
+  ts         BIGINT,
+  temperature_c DOUBLE,
+  humidity_pct  DOUBLE
+) WITH (
+  KAFKA_TOPIC = 'iot.telemetry.raw.v1',
+  VALUE_FORMAT = 'AVRO',
+  TIMESTAMP = 'ts'                 -- use device event time, not Kafka ingestion time
+);
+
+CREATE STREAM telemetry_clean AS
+  SELECT deviceId, seq, ts, temperature_c, humidity_pct
+  FROM telemetry_raw
+  WHERE temperature_c BETWEEN -60 AND 120      -- drop physically implausible readings
+    AND ts > 1700000000000                       -- reject epoch-zero boot timestamps
+  EMIT CHANGES;
+
+CREATE TABLE device_latest AS
+  SELECT deviceId,
+         LATEST_BY_OFFSET(temperature_c) AS temperature_c,
+         LATEST_BY_OFFSET(ts) AS last_ts
+  FROM telemetry_clean
+  GROUP BY deviceId
+  EMIT CHANGES;
+```
+
+A point on `LATEST_BY_OFFSET`: it returns the most recently consumed value, which is the last in log order, not necessarily the one with the greatest event time. When late data is possible, that distinction matters (see the next sections). Choose deliberately whether "latest" means arrival order or event time.
+
+### Window types
+
+Windowed aggregation groups events by time ranges before aggregating. ksqlDB provides three window types:
+
+| Window | Definition | Overlap | Typical use |
+| --- | --- | --- | --- |
+| Tumbling | Fixed size, contiguous, non-overlapping (for example, every 5 minutes) | None: each event is in exactly one window | Per-interval counts, averages, billing periods |
+| Hopping | Fixed size, advancing by a smaller step (size 10 minutes, advance by 2 minutes) | Yes: an event can fall in several windows | Smoothed moving aggregates |
+| Session | Dynamic: events within an inactivity gap belong to one window; a longer gap starts a new window | Windows merge when late events bridge gaps | Activity bursts, device on/off cycles, connectivity episodes |
+
+```sql
+-- title: windowed aggregates (illustrative)
+CREATE TABLE temp_5m AS
+  SELECT deviceId,
+         WINDOWSTART AS window_start,
+         WINDOWEND   AS window_end,
+         AVG(temperature_c) AS avg_temp,
+         MAX(temperature_c) AS max_temp,
+         COUNT(*)           AS readings
+  FROM telemetry_clean
+  WINDOW TUMBLING (SIZE 5 MINUTES, GRACE PERIOD 2 MINUTES)
+  GROUP BY deviceId
+  EMIT CHANGES;
+
+CREATE TABLE temp_hop AS
+  SELECT deviceId, AVG(temperature_c) AS avg_temp
+  FROM telemetry_clean
+  WINDOW HOPPING (SIZE 10 MINUTES, ADVANCE BY 2 MINUTES)
+  GROUP BY deviceId
+  EMIT CHANGES;
+
+CREATE TABLE conn_sessions AS
+  SELECT deviceId, COUNT(*) AS readings
+  FROM telemetry_clean
+  WINDOW SESSION (10 MINUTES)
+  GROUP BY deviceId
+  EMIT CHANGES;
+```
+
+### Aggregations and state
+
+Aggregations such as `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` and `LATEST_BY_OFFSET` are stateful: ksqlDB (through Kafka Streams) keeps their intermediate state in local RocksDB stores, backed by compacted changelog topics in Kafka so that state can be rebuilt on another node after a failure. Two consequences matter operationally. Rebuilding state after a node loss takes time proportional to the changelog size, during which that partition's processing is paused (standby replicas reduce this). And the number of distinct keys times windows retained is the state size, so retention of windowed state (the `RETENTION` clause on the window) should be no longer than your grace period plus the longest period you query.
+
+An aggregation is also a repartition boundary: grouping by a column that is not the current key makes ksqlDB repartition through an internal topic, which costs a full extra pass through Kafka. Choosing the Kafka key to match your most common GROUP BY avoids it.
+
+## Event time versus processing time
+
+Two clocks exist in the pipeline:
+
+- **Event time** is when the reading was taken, according to the device.
+- **Processing time** (or ingestion time) is when the pipeline saw it.
+
+They are equal only on a perfect network. In this architecture they diverge because of: device buffering during outages, MQTT persistent-session redelivery, bridge restarts, consumer lag, and Kafka replay (reprocessing yesterday's data today). A pipeline that aggregates by processing time produces windows that depend on how fast the pipeline happened to run; replaying history gives different results than the original run. Aggregating by event time makes results reproducible, at the price of having to decide when a window is complete.
+
+In ksqlDB, the `TIMESTAMP` property on a stream tells it to take each record's time from a column instead of the Kafka record timestamp. Without it, the record timestamp is used, and which timestamp that is (producer create time or broker log append time) depends on the topic's `message.timestamp.type` configuration. That is why the bridge sketch above sets the record timestamp from the device time. Either approach can work; mixing them accidentally is the mistake.
+
+A defensive rule worth encoding in the cleaning step: if the device event time is implausible (before a fixed epoch, or far in the future relative to ingestion time), either substitute the ingestion time and flag the record or route it to a quarantine topic. One device with its clock set to 2099 can otherwise advance stream time for its partition and cause legitimate records to be treated as late and dropped.
+
+## Late and out-of-order events: windows, stream time and grace period
+
+Kafka Streams (and therefore ksqlDB) tracks **stream time**: the maximum event timestamp observed so far in a partition (per stream task). A window closes for updates when stream time passes the window end plus the grace period. Events whose window is already closed are dropped (counted in Kafka Streams' dropped-records metrics) and do not update the result.
+
+The grace period is therefore the explicit tolerance for lateness: the longer it is, the more out-of-order data is captured and the longer windowed state is retained and results remain provisional. Details worth knowing, with the caveat that defaults have changed across versions and should be verified for yours:
+
+- **The default grace period depends on version.** Older Kafka Streams behavior kept windows open for a long default (24 hours), while newer API versions changed how grace is specified. In ksqlDB, specify `GRACE PERIOD` explicitly instead of relying on a default.
+- **Stream time only advances with data.** If a partition goes quiet (a device sends nothing, a low-traffic partition), its stream time stops and windows do not close, so a final result can be delayed indefinitely. This is the single most common surprise when moving from tests (continuous data) to production (sparse data). Idle partitions are a real feature of IoT workloads.
+- **Stream time is per task (per partition) and not global.** A hot partition and a quiet partition progress independently.
+- **Emission semantics.** `EMIT CHANGES` on a windowed aggregate emits an updated result on every incoming record, so downstream consumers see a sequence of revisions for the same window and must upsert by (key, window start). `EMIT FINAL` (available for windowed aggregations in newer ksqlDB versions, requires a grace period, and applies to table queries) suppresses intermediate results and emits one final result per window after the window closes. You pay the grace period in latency for a single, non-revised answer. Which is correct depends on the consumer: a dashboard wants early revisions, a billing export wants finality.
+
+A worked, illustrative example. A 5-minute tumbling window `[08:00, 08:05)` with a 2-minute grace period closes when stream time reaches 08:07. A reading with event time 08:04:30 arriving when stream time is 08:06:10 is late but within grace: it is included and the window result is revised. The same reading arriving when stream time is 08:07:20 is dropped from that window. If your devices buffer through outages of several minutes, a short grace period silently discards exactly the data that the QoS 1 session persistence worked to preserve. Match grace to your actual lateness distribution, which you must measure (event time versus ingestion time at the bridge), not guess.
+
+Use the explorer below to change the window type, size and grace period and to choose an arrival pattern (in order, jittered, a burst of late data after an outage). Note which events are included, revised or dropped.
+
+<StreamWindowExplorer />
+
+Compare the same arrival pattern with grace period zero versus a few minutes: the aggregate for early windows changes after the fact, and late events beyond grace are listed as dropped. Switch to session windows and watch two sessions merge when a late event lands in the gap between them. The explorer makes explicit simplifications: a single partition, one stream-time clock, no repartitioning, no suppression buffer limits, and no changelog or state-store behavior.
+
+## Delivery guarantees across the whole path, and idempotent design
+
+Each hop has its own guarantee; the end-to-end guarantee is the weakest composition unless you add idempotency:
+
+| Hop | Mechanism | Failure result | Mitigation |
+| --- | --- | --- | --- |
+| Device to broker | QoS 1, persistent session | Duplicate on lost PUBACK | Device `seq`/`msgId` |
+| Broker to bridge | QoS 1, manual ack, shared subscription | Duplicate on bridge crash after produce | Idempotent downstream |
+| Bridge to Kafka | `acks=all`, idempotent producer | Duplicates only across producer restarts | Dedup key in the record |
+| Kafka to ksqlDB | Offsets and state committed together (Kafka Streams processing guarantee, configurable at-least-once or exactly-once) | Reprocessing after failure | Enable exactly-once processing if the aggregate is not idempotent |
+| ksqlDB to MongoDB | Sink connector or consumer, at-least-once by default | Duplicate writes after retry | Deterministic `_id` or upsert, compare timestamps |
+
+Two points need care. First, Kafka's exactly-once processing guarantee (transactions, `read_committed` consumers) covers read-process-write inside Kafka. It does not extend to writes into MongoDB unless the sink is itself idempotent, because MongoDB participates in no Kafka transaction. Second, an aggregate like `COUNT` is not idempotent under duplicate input. A device that retried a reading inflates the count unless deduplication happens before the aggregation. In ksqlDB the practical options are to deduplicate in a stage before aggregating (using a keyed table keyed by `deviceId` plus `seq`, whose state needs a bounded retention) or to make the metric tolerant (using a max or last value rather than a sum).
+
+Reordering matters too. Across a shared-subscription bridge group, per-device order can be lost before Kafka (see above). Within Kafka the order is the order of arrival at the partition leader. So any consumer that needs the true device order must sort by event time or `seq` within a bounded buffer, or it must be written as a last-write-wins by timestamp rather than by arrival.
+
+## Replay and reprocessing
+
+Replay is the capability that justifies Kafka in the middle. Typical replay scenarios and what they require:
+
+- **A bug in the aggregation logic.** Deploy the fixed query under a new name writing to a new topic and table, replay from the earliest retained offset, then switch consumers. This works only if the raw topic's retention covers the period to fix, and it is the reason raw retention is longer than the sink's worst-case outage.
+- **A new consumer** needs history: it starts at the beginning of a topic. For compacted state topics this gives the current state; for raw topics, only the retained window.
+- **Sink outage recovery.** The sink resumes from its committed offsets. If it was down longer than retention, the data is gone, which is what the archive is for.
+- **A poisoned record.** A message that crashes a consumer on every attempt blocks that partition. Validate at the bridge, use a dead-letter topic, and make deserialization errors non-fatal with explicit logging and metrics.
+
+Replay re-delivers old events through a pipeline whose clock has moved on. Any logic that uses processing time, wall-clock `NOW()`, or time-limited deduplication state will behave differently on replay than live. This is a primary reason to run on event time and to keep deduplication keys in the data.
+
+## MongoDB: document design for state and history
+
+The sink writes two shapes of data, and they want different collections:
+
+1. **Device state** (current, one document per device, read by point lookups and updated constantly).
+2. **Telemetry history** (append-only measurements, queried by device and time range, aggregated, expired by age).
+
+### Latest-state collection
+
+```json
+{
+  "_id": "dev-000417",
+  "tenant": "acme-synth",
+  "site": "plant-3",
+  "fw": "1.8.3",
+  "status": "online",
+  "lastTs": { "$date": "2026-11-11T08:00:00Z" },
+  "lastSeq": 42,
+  "metrics": { "temperature_c": 21.4, "humidity_pct": 48.2 }
+}
+```
+
+This document is synthetic. Updating state from an at-least-once, possibly reordered stream requires a guard so that an old message does not overwrite a newer one. With an upsert filter that includes the timestamp condition, the update applies only if the stored document is older:
+
+```javascript
+// title: guarded state upsert (illustrative, mongosh)
+db.device_state.updateOne(
+  { _id: "dev-000417", $or: [ { lastTs: { $lt: new Date("2026-11-11T08:00:00Z") } },
+                              { lastTs: { $exists: false } } ] },
+  { $set: { lastTs: new Date("2026-11-11T08:00:00Z"), lastSeq: 42,
+            "metrics.temperature_c": 21.4 } },
+  { upsert: true }
+)
+```
+
+Be aware of the upsert edge case: if the document exists with a newer `lastTs`, the filter does not match and the upsert attempts to insert a document with the same `_id`, which fails with a duplicate key error. Handle that error as "stale update, ignore". It is the cheap and correct outcome. Alternatively use an aggregation-pipeline update with conditional expressions on `lastTs`, which handles both cases in one statement.
+
+### History: time-series collections
+
+MongoDB time-series collections (introduced in 5.0) are designed for this workload. Internally the server groups measurements into buckets by metadata and time, stores them in a columnar-compressed format in newer versions, and exposes them as an ordinary-looking collection of flat documents. The key parameters:
+
+```javascript
+// title: time-series collection (illustrative, mongosh; option availability depends on server version)
+db.createCollection("telemetry", {
+  timeseries: {
+    timeField: "ts",
+    metaField: "meta",
+    granularity: "minutes"
+  },
+  expireAfterSeconds: 60 * 60 * 24 * 90   // 90 days, illustrative
+})
+```
+
+```json
+{
+  "ts": { "$date": "2026-11-11T08:00:00Z" },
+  "meta": { "deviceId": "dev-000417", "site": "plant-3", "type": "thermo" },
+  "temperature_c": 21.4,
+  "humidity_pct": 48.2,
+  "seq": 42
+}
+```
+
+What to know, with version qualifications:
+
+- **`timeField`** is required and holds a BSON date. **`metaField`** names the field for the series identity (device, site, sensor type). It should hold values that rarely change for a given source; the server buckets by it. Never put measurement values in the metadata, and avoid high-cardinality or constantly changing values in it, since that defeats bucketing.
+- **`granularity`** (`seconds`, `minutes`, `hours`) hints at the expected spacing of measurements for a series so the bucket time span is chosen appropriately. Pick the one that matches your typical interval per device; for a reading every few seconds per device, `seconds`; every minute or so, `minutes`. Newer versions (6.3 and later) allow custom bucketing parameters instead; check the version.
+- **Storage and performance.** Buckets reduce per-document overhead and index size compared with one regular document per reading, and compress repetitive fields well. The benefit is workload dependent, so measure with representative data rather than trusting a ratio.
+- **Indexes.** Secondary indexes on time-series collections are supported from 5.0 for metadata and from 6.0 for measurement fields (with a compound index on metadata and time recommended for per-device range queries). Depending on version, an index on metadata plus time may be created automatically. Verify on your server.
+- **Expiry.** `expireAfterSeconds` removes data automatically by bucket, so deletion is coarse: a bucket expires after the whole time range it covers is beyond the threshold, meaning data can live slightly longer than the nominal retention. Time-series collections can also be reconfigured for expiry after creation via `collMod`.
+- **Mutations are restricted.** Historically time-series collections allowed inserts and bulk deletes by metadata, with limited update and delete support, which relaxed in later versions (7.0 broadened these). Do not design a pipeline that relies on updating or correcting individual measurements unless you have confirmed your version supports it.
+- **No unique indexes on time-series collections.** This is the most important constraint for an at-least-once pipeline: you cannot enforce a unique `(deviceId, ts)` constraint to reject duplicates. Duplicates must therefore be removed upstream, or tolerated and eliminated at query time (for example with `$group` on `seq`), or the history can be written to a regular collection with a deterministic `_id` when strict idempotency matters more than storage efficiency.
+- **Sharding.** Time-series collections can be sharded in versions that support it (5.1 onward), with the shard key restricted to the metaField and/or the timeField subfields. Shard by a device-identity key so that a device's data co-locates.
+
+A regular collection with bucketed documents designed by hand (the "bucket pattern": one document per device per hour with an array of readings) is the pre-5.0 alternative and is still reasonable if you need exact-once upserts, richer updates or a server older than 5.0. The cost is that your application owns bucket sizing, array growth limits (document size cap of 16 MB) and querying.
+
+### Queries and indexing
+
+Typical queries and the supporting structure:
+
+| Query | Shape | Support |
+| --- | --- | --- |
+| Current state of device | `find({_id: id})` on `device_state` | Primary key |
+| Last hour for device | `find({"meta.deviceId": id, ts: {$gte: t0}})` | Compound index on `meta.deviceId`, `ts` |
+| Fleet average per hour for a site | `aggregate([$match site+ts, $group by $dateTrunc(ts,'hour')])` | Index on `meta.site`, `ts`; or precomputed rollups |
+| Devices not seen for 15 minutes | `find({lastTs: {$lt: cutoff}})` on `device_state` | Index on `lastTs` |
+| Anomaly windows | read the ksqlDB-produced aggregates | A separate rollup collection |
+
+Prefer to have ksqlDB write the common rollups (5-minute and hourly aggregates) into a regular collection that dashboards read, rather than aggregating raw history on every dashboard refresh. Keep raw history for drill-down and recomputation.
+
+```javascript
+// title: hourly average per site (illustrative aggregation)
+db.telemetry.aggregate([
+  { $match: { "meta.site": "plant-3",
+              ts: { $gte: ISODate("2026-11-10T00:00:00Z"),
+                    $lt:  ISODate("2026-11-11T00:00:00Z") } } },
+  { $group: { _id: { $dateTrunc: { date: "$ts", unit: "hour" } },
+              avgTemp: { $avg: "$temperature_c" },
+              n: { $sum: 1 } } },
+  { $sort: { _id: 1 } }
+])
+```
+
+Browse representative synthetic documents, toggle index choices, and run the sample queries to see which are index-supported and how the storage trade-offs change with retention.
+
+<MongoDataExplorer />
+
+You should see that the per-device range query with a compound index examines only the matching entries while the same query without it scans broadly, and that expiry settings change the estimated footprint linearly with the retention period. The explorer works on synthetic documents and illustrative cost estimates; it does not run a MongoDB server, and its figures are not benchmarks.
+
+### Retention, indexing and storage cost
+
+Cost in this tier comes from three multipliers: retention period, per-reading size, and index overhead. Illustrative arithmetic (not a measurement): 10,000 devices reporting every 10 seconds produce 1,000 messages per second, or 86.4 million readings per day. At an uncompressed document size of roughly 150 bytes, that is on the order of 13 GB per day before compression, replication and index overhead; over a 90-day retention that is about 1.2 TB raw. Time-series bucketing and compression reduce this by a factor that depends on the data (smoother signals compress better) and that you should measure on a real sample. The lever with the largest effect is the retention policy: tier it. Keep raw readings for weeks, keep 5-minute rollups for months, keep hourly rollups for years, and archive raw events from Kafka to object storage for compliance or reprocessing.
+
+## Capacity and bottleneck analysis
+
+A systematic way to size the platform is to walk the pipeline and compute each stage's load from one set of assumptions. Illustrative inputs: 100,000 devices, one reading each 10 seconds, 250-byte messages on the wire.
+
+- **Ingest rate**: 100,000 / 10 s = 10,000 messages per second, about 2.5 MB/s of payload (before MQTT and TLS framing). That is a modest rate for a clustered broker and for Kafka; the limit you hit first is usually connection count, not bandwidth.
+- **Connections**: 100,000 persistent TLS connections. Memory per connection (TLS buffers, session state, in-flight windows) and file-descriptor limits drive broker sizing, and reconnect storms are the peak load: if all devices reconnect within a minute, that is thousands of TLS handshakes per second, which is far more demanding than steady state. Throttle and jitter.
+- **Kafka**: with replication factor 3 the cluster writes roughly 3 times the ingest bandwidth (about 7.5 MB/s) plus the derived topics. The raw topic at one week retention holds about 2.5 MB/s times 604,800 s, around 1.5 TB per replica set of one copy before compression (and about 4.5 TB across three replicas). Compression (zstd or lz4) typically cuts JSON substantially, and Avro or Protobuf reduces it further; again, measure.
+- **Partitions**: if one consumer thread processes 10,000 to 50,000 simple records per second (workload dependent, to be measured), the consumer side needs few partitions for throughput; the partition count is then driven more by growth headroom, consumer parallelism for heavier stages, and key distribution. A figure in the tens of partitions for the raw topic is a plausible starting point for this load, to be validated.
+- **ksqlDB**: the cost is dominated by state, not CPU: number of keys, windows retained, RocksDB memory, and changelog size.
+- **MongoDB**: 10,000 inserts per second into a time-series collection is feasible on suitably sized hardware with batching (bulk inserts via the sink), but this is workload and hardware dependent. Batch size, write concern, and index count are the levers. Every extra index multiplies write cost.
+
+Bottlenecks tend to move in this order as you scale: broker connection handling and TLS; the bridge (single-threaded ack-after-write loops); one hot Kafka partition; ksqlDB state restore time after failures; MongoDB write throughput and index memory. Test with a replay of representative traffic, not with synthetic uniform load, because skew and burstiness cause most real incidents.
+
+## Failure modes and recovery
+
+| Failure | What happens | Recovery behavior and design response |
+| --- | --- | --- |
+| Device loses connectivity | Keep-alive expires; broker publishes last-will (`status: offline`) | Retained status topic gives the current view; device reconnects with backoff; buffered readings arrive late, covered by grace period |
+| Broker node failure | Clients disconnect, reconnect to another node; session state may or may not be replicated | Depends on broker clustering. Verify that persistent sessions and in-flight QoS 1/2 state survive failover; otherwise expect loss of in-flight messages |
+| Bridge crash | Unacked QoS 1 messages redelivered | Duplicates, handled downstream; no loss with ack-after-durable-write |
+| Kafka broker failure | Leader election; producers retry | With `acks=all`, `min.insync.replicas=2`, no acknowledged data loss; brief produce errors and latency |
+| Kafka unavailable for long | Bridge stops acking; broker queues fill | Define broker queue limits and overflow policy; alert on bridge lag; devices keep retrying |
+| ksqlDB node failure | Tasks reassigned; state restored from changelog | Processing pause proportional to state size; standby replicas shorten it |
+| Poison or malformed message | Consumer or query errors repeatedly | Validate at the bridge; dead-letter topic; deserialization error handling |
+| Device clock wrong | Records appear far in past or future | Quarantine implausible timestamps; compare with ingestion time; never let one device advance stream time |
+| MongoDB slow or unavailable | Sink falls behind; consumer lag grows | Kafka absorbs it within retention; alert on lag before retention is at risk |
+| Duplicate writes | Retries produce duplicates | Idempotent writes in state; dedupe strategy for time-series (no unique index) |
+| Schema change breaks consumers | Deserialization failures | Registry compatibility checks at produce time; versioned topics |
+
+Two failure modes deserve emphasis because they are quiet. The first is stream time stalling on idle partitions, leaving windows open with no error. The second is silent drop of late events beyond grace, which shows up only in the dropped-records metric. Neither throws an exception, so both need explicit monitoring.
+
+## Monitoring, alerting and scaling
+
+Metrics worth collecting, by layer, and the alert each supports. The thresholds are starting points to tune against your baseline, not universal values.
+
+| Layer | Metric | Why and when to alert |
+| --- | --- | --- |
+| Broker | Connected clients; connection and reconnect rate | Sudden drop or spike indicates network incident or reconnect storm |
+| Broker | Messages dropped, queue depth per session, in-flight count | Rising queue means a consumer (the bridge) is not keeping up; drops are data loss |
+| Broker | Auth failures, ACL denials | Credential problems or probing |
+| Bridge | Consume-to-produce latency; unacked count; error and DLQ rate | Latency growth signals Kafka trouble; DLQ rate signals bad firmware |
+| Kafka | Under-replicated and offline partitions; ISR shrink | Durability risk; page on offline partitions |
+| Kafka | Consumer lag per group and partition | Skew shows as lag on one partition; alert on lag relative to retention, not just absolute size |
+| Kafka | Disk usage and retention headroom | Lag approaching retention means impending data loss |
+| ksqlDB | Processing lag, dropped late records, state restoration time, RocksDB memory | Late-drop count validates your grace period; restoration time bounds recovery |
+| MongoDB | Insert rate and latency, queue, cache pressure, index size versus RAM, replication lag | Index working set exceeding memory degrades writes sharply |
+| End to end | Event-time to queryable-time latency (freshness) | The user-visible SLO; measure it with a synthetic canary device publishing a known payload |
+
+The canary is the single most useful monitoring construct: a few synthetic devices publish at a known rate, and a probe measures when each reading becomes visible in MongoDB. It validates the whole chain including parts that report healthy individually.
+
+Scaling paths, in rough order of increasing cost: add bridge instances behind a shared subscription; add consumer instances up to the partition count; add partitions (accepting the key-mapping discontinuity, ideally planned in advance); scale the broker cluster horizontally (MQTT clusters scale connections but sometimes with cross-node routing overhead for subscriptions); scale ksqlDB nodes (bounded by partition count and state); shard MongoDB by device identity. Multi-region deployments add a replication layer (mirroring Kafka topics or regional bridges) and with it all the ordering and duplication questions again.
+
+## Security considerations beyond the edge
+
+- **Kafka.** Enable TLS and SASL (SCRAM, OAUTHBEARER or mTLS) for clients and brokers and use ACLs per principal: the bridge can write only to raw topics, ksqlDB can read raw and write derived topics, the sink can read derived topics only.
+- **Multi-tenancy.** If tenants share a cluster, enforce isolation in the topic and key design, ACLs, MongoDB database or collection-level roles, and in every query. Tenant ID derived from the authenticated device identity, never from an unauthenticated payload field.
+- **Secrets.** Connector configs, broker passwords and database URIs belong in a secret store or a connector config provider, not in plaintext config files or repositories.
+- **MongoDB.** Enable authentication and TLS, apply least-privilege roles (the sink needs insert or update on specific collections only), restrict network exposure, and consider field-level or at-rest encryption for sensitive attributes.
+- **Data protection.** Telemetry can be personal data (a home sensor, a vehicle). Retention limits, deletion on request and access logging are design requirements. Time-series collections' restricted deletes (version dependent) complicate per-subject deletion, which is a reason to decide this before choosing the storage layout.
+- **Schema validation as security.** Rejecting oversize or malformed payloads at the bridge protects every downstream stage from untrusted input.
+
+## Assumptions and limitations
+
+- Design numbers (fleet sizes, rates, payload sizes, retention periods, storage estimates) are illustrative arithmetic and not measurements of any system. Real throughput depends on hardware, message size, partitioning, serialization, and configuration; benchmark with your own data.
+- Version-dependent facts (MQTT broker features, ksqlDB window options and emission modes, Kafka defaults, MongoDB time-series capabilities) are stated with the versions where known; verify against the versions you deploy, as these features have changed across releases.
+- Configuration and code snippets are plausible and illustrative, not validated against a specific version, and are not production hardening guides.
+- Broker-specific behavior (session replication on failover, shared-subscription distribution, queue overflow) varies by implementation and is not described here for any one product.
+- The interactive labs are synthetic simulations with deliberate simplifications (a simple hash instead of murmur2, one partition and one stream clock in the window explorer, no real MongoDB engine). They illustrate mechanisms, not performance.
+- The design assumes at-least-once ingestion with idempotent consumers. Systems that must have strict exactly-once semantics end to end need additional design (transactional outbox patterns, deduplication stores, or a sink with transactional support), which is beyond this article.
+- Not covered: device firmware and OTA updates, edge buffering design, HTTP and CoAP ingestion, long-term analytics engines, and multi-region topologies.
+
+## Conclusion
+
+The platform works because each layer is given the one job it is built for, and because every boundary is treated as a place where duplicates, reordering and delay can enter. MQTT gives constrained devices a session-aware link, and QoS 1 with persistent sessions is a sensible default. Kafka turns that stream into a keyed, replayable log. ksqlDB computes over event time with an explicit lateness budget. MongoDB serves two shapes of data from two collections. Duplicates are handled by idempotent design at the edges of the system, not by hoping a protocol guarantee reaches that far. The failure modes that hurt are quiet ones: stalled stream time, silently dropped late events, a hot partition, unreplicated session state, so those are the metrics to instrument first.

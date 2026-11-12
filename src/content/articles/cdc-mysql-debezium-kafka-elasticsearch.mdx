@@ -1,0 +1,544 @@
+---
+title: "From MySQL to Elasticsearch: Building a Reliable CDC Pipeline That Scales to 1,000 RPS"
+description: "A practical design for streaming MySQL changes into Elasticsearch with Debezium and Kafka: ordering, idempotency, failure recovery, and an honest derivation of what 1,000 RPS means for CDC event rates."
+date: "2026-11-11"
+status: "published"
+category: "Distributed Systems"
+tags: ["Kafka", "Debezium", "MySQL", "Elasticsearch", "CDC"]
+featured: true
+series: "Article 01"
+related: ["iot-mqtt-kafka-ksqldb-mongodb", "ip-cameras-rtsp-video-streaming"]
+---
+
+## The problem: a transactional store that must also answer search queries
+
+A relational database is the right place to decide what is true. It is the wrong place to answer "find all orders mentioning this customer name, a misspelt product, and a date range, ranked by relevance". Search workloads need inverted indexes, analyzers, relevance scoring, faceting and horizontal read scaling. Those are Elasticsearch's strengths, and bolting them onto MySQL with `LIKE '%term%'` and a growing pile of composite indexes ends with slow queries that also compete with transactional traffic for buffer pool and IO.
+
+So the system ends up with two stores: MySQL as the system of record, Elasticsearch as a derived, query-optimised view. The engineering problem is keeping the view correct. "Correct" has four concrete parts:
+
+- **Completeness.** Every committed change eventually appears in the index. No silent drops.
+- **Ordering.** For a given entity, the index never ends up holding an older version than a newer one that was already applied.
+- **Bounded staleness.** The delay between commit and searchability is measurable and has an alert on it.
+- **Recoverability.** When something breaks (and it will), there is a defined path back to a provably consistent index.
+
+The title promises a pipeline that "scales to 1,000 RPS". That phrase needs care before anything else, because 1,000 requests per second is a property of the application's front door, not of the replication pipeline. We derive the real CDC event rate from first principles in the capacity section, and the calculator in that section lets you vary every assumption. This article does not present benchmark results; every number below is either a documented protocol or product fact (qualified by version where it matters) or explicitly labelled illustrative arithmetic.
+
+<Callout type="assumption" title="Scope and assumptions">
+
+The design assumes MySQL 8.x (or a compatible MySQL 5.7 setup) with row-based binary logging, a Kafka cluster operated by the team, Kafka Connect for the Debezium source, and Elasticsearch 7.x or 8.x. Configuration snippets are illustrative and not validated against a specific version; property names differ between Debezium 1.x and 2.x and we call out the ones we know changed. The author has worked with this class of pipeline; no production figures from any employer or customer appear here.
+
+</Callout>
+
+## Why synchronize a relational database to a search index at all
+
+There are three common reasons, and they imply different tolerance for staleness.
+
+1. **Query shape.** Full-text relevance, fuzzy matching, prefix completion, multi-field faceting and geo queries are native to Lucene-based engines and awkward in a B-tree-centred engine.
+2. **Workload isolation.** Search queries are often wide, unpredictable and bursty. Moving them to a separate cluster means a bad query cannot evict the hot working set of the OLTP database.
+3. **Denormalised read models.** A search document commonly joins several tables (order, customer, line items) into one nested document so a query touches one index rather than performing joins.
+
+What this buys is read-side scale and flexibility. What it costs is a second system with its own failure modes, eventual consistency between the two, and an operational burden that did not exist before. If a single MySQL instance with a `FULLTEXT` index serves the query load acceptably, stop here. The pipeline below is justified when search load, relevance requirements or document shape outgrow that.
+
+## Polling versus change data capture
+
+The naive synchronisation is a poller: every few seconds, `SELECT * FROM orders WHERE updated_at > :last_seen`, push the rows to Elasticsearch, advance the watermark. It is easy to build and has real problems.
+
+| Concern | Polling on `updated_at` | Log-based CDC |
+|---|---|---|
+| Deletes | Invisible unless you soft-delete everywhere | Captured as delete events |
+| Intermediate states | Only the latest state at poll time | Every committed row change, in commit order |
+| Load on the source | Repeated range scans, index on `updated_at` needed | Reads the binary log like a replica, no queries on tables after the snapshot |
+| Missed rows | Clock skew, long transactions and equal timestamps can hide rows behind the watermark | Position in the log is the watermark; it is monotonic |
+| Latency | Poll interval plus query time | Typically sub-second to seconds, dependent on the pipeline |
+| Schema coupling | Needs a reliable `updated_at` on every table, maintained by every writer | Writer-agnostic: ad-hoc SQL, migrations and other services are captured |
+
+The subtle poller bug is the transaction-visibility race: a transaction that started earlier but commits later can carry an `updated_at` older than the current watermark, so a poller that already advanced past that time never sees the row. Log-based CDC sidesteps this because the binary log is written in commit order.
+
+CDC is not free. It requires binary logging configuration on the database, a long-running connector, and a team willing to operate Kafka. It also exposes the database's physical change stream, including changes you may not want in a search index (backfills, bulk maintenance jobs), so the consumer needs filtering and sometimes throttling.
+
+## MySQL binlog mechanics and why row format matters
+
+MySQL's binary log records changes to data in the order transactions commit. Three formats exist: `STATEMENT` (the SQL text), `ROW` (the before and after images of changed rows) and `MIXED`. CDC needs `ROW`: a statement like `UPDATE orders SET status = 'shipped' WHERE created_at < '2026-01-01'` tells you nothing about which rows changed, while row events carry the primary key and column values of each affected row.
+
+The settings that matter, illustrative for MySQL 8.x:
+
+```properties
+# title: my.cnf (illustrative, not validated against a specific version)
+server-id                       = 223344
+log_bin                         = mysql-bin
+binlog_format                   = ROW
+binlog_row_image                = FULL
+gtid_mode                       = ON
+enforce_gtid_consistency        = ON
+binlog_expire_logs_seconds      = 604800
+```
+
+- `binlog_row_image=FULL` records all columns in both images. `MINIMAL` records only changed columns plus the key, which cuts log volume but leaves Debezium unable to produce a complete `before` or `after` for some events. Debezium's documentation expects `FULL`.
+- GTIDs make the connector's position survive failover to a replica, because a GTID set identifies transactions independent of file name and offset. Without them the position is a binlog file name and offset, which differ between servers.
+- Binlog retention is a hard recovery boundary. If the connector is down longer than the retention window, the position it needs no longer exists on disk and the only way back is a new snapshot. Choose retention against your worst-case outage-to-fix time, not against disk comfort.
+
+A transaction's row events are written contiguously at commit. That has two consequences. The connector can only emit a transaction's changes after it commits (so a very large batch update appears as a burst), and each affected row becomes its own event, which is the origin of the "events per write" factor in the capacity model later.
+
+## Architecture overview
+
+The pipeline has five stages and one side channel.
+
+<FlowDiagram
+  title="End-to-end CDC data path"
+  steps={[
+    {label:"MySQL", sub:"row-based binlog", tone:"store"},
+    {label:"Debezium", sub:"Kafka Connect source"},
+    {label:"Kafka", sub:"keyed topics", tone:"store"},
+    {label:"Indexing consumer", sub:"batch + bulk"},
+    {label:"Elasticsearch", sub:"index + alias", tone:"store"}
+  ]}
+/>
+
+The side channel is the failure path: records that cannot be indexed go to a dead-letter topic rather than blocking the stream, and a schema history topic lets the connector re-interpret old binlog positions with the table definitions that were current at the time.
+
+<Figure label="Fig 1" caption="Responsibilities by stage. Each stage owns one guarantee and hands the rest downstream.">
+
+| Stage | Owns | Does not own |
+|---|---|---|
+| MySQL | Truth, commit order, binlog | Delivery to anyone |
+| Debezium | Reading the log, snapshot, converting rows to events, tracking position | Durability of events beyond Kafka, search semantics |
+| Kafka | Durable, replicated, ordered-per-partition log; replay | Interpreting payloads |
+| Indexing consumer | Transformation to documents, batching, retries, idempotent writes, DLQ | Ordering across partitions |
+| Elasticsearch | Serving queries, shard-level durability | Knowing whether a document is the newest version (unless you tell it) |
+
+</Figure>
+
+The most important property of this design is that Kafka decouples the rate at which the database produces changes from the rate at which Elasticsearch can absorb them. The log is the buffer. Everything that follows (backpressure, lag, recovery) is about managing that buffer.
+
+The explorer below animates a single synthetic change through the five stages. Pick a stage to see what it is responsible for, how it fails and what constrains its scaling, then run the animation to see where the event's identity (key, version, operation) is established and where it can be duplicated.
+
+<CdcArchitectureExplorer />
+
+What to take from it: failure modes cluster at the boundaries (connector to Kafka, consumer to Elasticsearch), and each boundary has a different delivery semantic. Debezium plus Kafka is a durable hand-off; consumer plus Elasticsearch is a retry loop that yields at-least-once, which is the reason the whole design leans on idempotent writes.
+
+## Debezium: connector behaviour, snapshots and the event envelope
+
+Debezium's MySQL connector runs inside Kafka Connect as a source connector. It presents itself to MySQL as a replica, requests the binlog stream, parses row events, and produces Kafka records. Two properties are fundamental.
+
+First, the MySQL connector runs as a single task. There is one ordered binlog to read, so `tasks.max` greater than one does not parallelise a MySQL source connector. The throughput ceiling of the capture side is therefore the speed of one thread parsing and producing, and the scaling lever is splitting tables across several connector instances (each with its own `server-id` and its own table include list) if one is not enough.
+
+Second, the connector keeps its position (binlog file and offset, or a GTID set) in Kafka Connect's offset storage, which is committed periodically, not per event. After a crash the connector resumes from the last committed offset and may re-emit events it already produced. That is the first source of duplicates in the pipeline, and it is a normal, documented behaviour rather than a bug.
+
+### Snapshot behaviour
+
+When a connector starts for the first time (snapshot mode `initial` by default), it must first produce the current contents of the tables, because the binlog only holds changes. In outline, in the default mode:
+
+1. Take a consistent view and record the current binlog position. By default this involves a short global read lock, or table locks depending on configuration, and is why the connector's snapshot locking mode deserves a conversation with the DBA.
+2. Read the schema of the captured tables.
+3. Scan each table and emit one read event (`op: "r"`) per row.
+4. Switch to streaming from the position recorded in step 1.
+
+The snapshot is the heaviest thing the connector ever does: it scans full tables on the primary or a replica. Debezium also supports incremental snapshots (available since the 1.6 line), triggered through a signalling table, which interleave chunked reads of a table with the live stream using watermarks. Incremental snapshots are the preferred tool for backfilling a single table or re-syncing an index later without stopping capture, and we use them in the recovery section.
+
+Other snapshot modes exist (for example schema-only, when-needed, and never; names and availability differ across Debezium versions). Schema-only is useful when the downstream is already populated and only changes matter. Verify the exact mode names against your Debezium version.
+
+### The event envelope
+
+A row change becomes a Kafka record whose key is the primary key of the row (as a structure with the key columns) and whose value is an envelope. Illustrative payload for an update, simplified and with synthetic values:
+
+```json
+// title: orders update event value (illustrative, simplified)
+{
+  "before": { "id": 1042, "customer_id": 77, "status": "paid",    "total_cents": 12900, "updated_at": 1790000000000 },
+  "after":  { "id": 1042, "customer_id": 77, "status": "shipped", "total_cents": 12900, "updated_at": 1790000042000 },
+  "source": {
+    "connector": "mysql",
+    "name": "shop",
+    "db": "shop",
+    "table": "orders",
+    "file": "mysql-bin.000412",
+    "pos": 981233,
+    "gtid": "3E11FA47-71CA-11E1-9E33-C80AA9429562:5123",
+    "ts_ms": 1790000042000
+  },
+  "op": "u",
+  "ts_ms": 1790000042310
+}
+```
+
+The operation codes are `c` (create), `u` (update), `d` (delete), `r` (snapshot read). The `source` block locates the change in the log, which will matter when we choose a document version. Note the two timestamps: `source.ts_ms` is when the change was recorded in the database; the outer `ts_ms` is when the connector processed it. Their difference is a free measure of capture latency.
+
+Topics are named by prefix, database and table (for example `shop.shop.orders` under the Debezium 2.x `topic.prefix` property; Debezium 1.x used `database.server.name`). One topic per table is the default and the right starting point: it keeps schemas homogeneous and lets consumers scale and fail per table.
+
+A representative connector definition, illustrative and not validated against a specific version:
+
+```json
+// title: mysql-source.json (illustrative, Debezium 2.x style)
+{
+  "name": "shop-mysql-source",
+  "config": {
+    "connector.class": "io.debezium.connector.mysql.MySqlConnector",
+    "tasks.max": "1",
+    "database.hostname": "mysql.internal",
+    "database.port": "3306",
+    "database.user": "debezium",
+    "database.password": "${file:/secrets/mysql.properties:password}",
+    "database.server.id": "223344",
+    "topic.prefix": "shop",
+    "database.include.list": "shop",
+    "table.include.list": "shop.orders,shop.order_items,shop.customers",
+    "snapshot.mode": "initial",
+    "snapshot.locking.mode": "minimal",
+    "tombstones.on.delete": "true",
+    "decimal.handling.mode": "string",
+    "time.precision.mode": "connect",
+    "schema.history.internal.kafka.bootstrap.servers": "kafka-1:9092",
+    "schema.history.internal.kafka.topic": "schema-history.shop",
+    "max.batch.size": "2048",
+    "max.queue.size": "8192",
+    "heartbeat.interval.ms": "10000"
+  }
+}
+```
+
+A few of these settings carry reasoning. `decimal.handling.mode` set to string avoids lossy floating-point conversion of money columns. `heartbeat.interval.ms` makes the connector advance its offset even when captured tables are quiet but the database is busy with other tables, which prevents the stored binlog position from falling behind the retention window. `max.batch.size` and `max.queue.size` size the internal buffer between the binlog reader and the producer, and the queue's remaining capacity is one of the metrics worth watching.
+
+## Kafka Connect and topic design
+
+Topic design is where later pain is decided cheaply or expensively.
+
+- **Replication and durability.** Production topics normally use replication factor 3 with `min.insync.replicas=2`, and producers with `acks=all`. That combination tolerates one broker loss without losing acknowledged records. Kafka Connect's source producer settings can be overridden per connector where the worker policy allows.
+- **Retention.** Retention must exceed your worst-case consumer outage plus recovery time, because the topic is the replay buffer. Time-based retention of days is typical in this kind of design; the right number is a function of the on-call response time, not a default.
+- **Compaction.** A compacted topic keeps at least the latest record per key, which lets you rebuild current state from the topic alone. It is a useful property for a CDC topic of a table, with a caveat: compaction removes history, so it cannot serve consumers who want every intermediate change. Many teams keep delete-retention generous enough that a slow consumer still sees tombstones before they are purged (`delete.retention.ms`).
+- **Partition count.** Chosen up front, with headroom, for reasons covered next. Changing it later is possible only in one direction and has an ordering cost.
+- **Schemas.** Either JSON with embedded schema (verbose, self-describing) or Avro/Protobuf/JSON Schema with a schema registry (compact, with enforced compatibility rules). The registry option costs an extra service and pays off in schema-evolution safety.
+
+## Event keys, partitioning, ordering scope and consumer parallelism
+
+Kafka guarantees order only within a partition. The default partitioner hashes the record key (murmur2) modulo the partition count, so all records with the same key land in the same partition and are therefore consumed in the order they were produced. Debezium keys records by the row's primary key, so all changes to order 1042 are ordered relative to each other. Changes to order 1042 and order 1043 are not ordered relative to each other, and for a search index they do not need to be: documents are independent.
+
+This is the correct scope of ordering for this problem, and it is worth stating plainly because it is often misunderstood in both directions. There is no global ordering across the table and none is needed. There is per-entity ordering, which is exactly what stops an old `status: paid` from overwriting a newer `status: shipped`.
+
+Three practical consequences follow.
+
+**Consumer parallelism is bounded by partitions.** Within a consumer group, each partition is assigned to at most one consumer at a time. With 12 partitions, 12 consumers can work concurrently; a thirteenth sits idle. Adding consumers beyond the partition count adds standby capacity for failover but no throughput. Conversely, fewer consumers than partitions simply means some consumers own several partitions.
+
+**Partition count is a one-way door with an ordering cost.** Kafka can increase a topic's partitions but not decrease them. After an increase, `hash(key) mod new_count` differs from the old mapping for many keys, so a key's new records can land in a different partition from its older ones. If the old partition still has an unconsumed backlog while a different consumer processes the key's new events, per-key order is not guaranteed across the boundary. The safe sequence is to drain the consumer group to zero lag before changing the partition count, or to rely on version checks in Elasticsearch (below) so out-of-order application is harmless. Over-provisioning partitions modestly at creation is cheaper than either.
+
+**Skew caps the speed-up.** If one key (a very hot row) produces most of the events, its partition and its consumer are the bottleneck regardless of how many partitions exist. Per-key ordering and per-key parallelism are mutually exclusive by definition.
+
+The explorer below lets you set the partition and consumer counts and see assignments, idle consumers and the effect of re-partitioning on key placement. Try 6 partitions with 10 consumers, then 6 partitions with 3 consumers, then raise partitions while watching where the same keys land.
+
+<KafkaPartitionExplorer />
+
+You should see that effective parallelism is the minimum of consumer count and partition count, that idle consumers appear as soon as consumers exceed partitions, and that raising the partition count moves some keys to different partitions, which is the ordering hazard described above.
+
+## From event to Elasticsearch document
+
+The indexing consumer has three jobs: flatten the envelope into a document, choose the document identity, and write in bulk.
+
+**Flattening.** The envelope's `after` image is the document body. Debezium ships an `ExtractNewRecordState` single message transform that unwraps the envelope in Kafka Connect, and the same logic is simple to write in a custom consumer. If you want to keep metadata (operation, source timestamp), add it as fields prefixed with a double underscore or place it under a reserved `_cdc` object so it cannot collide with business columns.
+
+**Identity.** Use the primary key as the Elasticsearch `_id`. Writes then become idempotent upserts: indexing the same `_id` twice yields the same document, so duplicate delivery from Kafka is harmless as long as the content is the same. For a composite primary key, join the components with a delimiter that cannot occur in the data, or use a hash.
+
+**Mapping.** Explicit mappings are better than dynamic ones for a derived index. Dynamic mapping infers a type from the first value it sees, so a field first seen as `"12"` becomes a `text` field with a `keyword` sub-field, and a field first seen as a number cannot later hold an arbitrary string. Set `dynamic: "strict"` so an unexpected new column fails loudly instead of silently reshaping the mapping. Illustrative mapping:
+
+```json
+// title: orders-v1 index mapping (illustrative)
+{
+  "settings": {
+    "number_of_shards": 3,
+    "number_of_replicas": 1,
+    "refresh_interval": "5s"
+  },
+  "mappings": {
+    "dynamic": "strict",
+    "properties": {
+      "id":          { "type": "long" },
+      "customer_id": { "type": "long" },
+      "status":      { "type": "keyword" },
+      "notes":       { "type": "text", "analyzer": "standard" },
+      "total_cents": { "type": "long" },
+      "updated_at":  { "type": "date", "format": "epoch_millis" },
+      "_cdc": {
+        "properties": {
+          "op":      { "type": "keyword" },
+          "src_ts":  { "type": "date", "format": "epoch_millis" }
+        }
+      }
+    }
+  }
+}
+```
+
+Money as integer cents avoids float rounding; `status` as `keyword` supports filtering and aggregations; `notes` as `text` supports full-text. A field that needs both gets a multi-field. Mapping types cannot be changed in place for an existing field, which is the reason the index is named with a version suffix (`orders-v1`) and queried through an alias (`orders`). A mapping change becomes: create `orders-v2`, backfill it, switch the alias atomically, delete `orders-v1`.
+
+**Bulk indexing.** Single-document requests are dominated by per-request overhead. The `_bulk` API accepts many actions per request. Batch size should be sized by bytes as much as by count; a starting range of a few MB to low tens of MB per request is a commonly cited guideline, but the right value depends on document size, hardware and cluster state, and it should be tuned by measurement rather than adopted. Bulk responses are per-item: the HTTP status can be 200 while individual items failed, so the consumer must inspect every item result.
+
+Two Elasticsearch settings shape throughput and freshness: `refresh_interval` (default one second) controls when new documents become searchable, and raising it reduces segment-creation overhead at the cost of staleness; and the replica count, since each indexed document is written to the primary and every replica. During a large backfill it is common to temporarily disable replicas and lengthen the refresh interval, restoring them afterwards.
+
+## Insert, update, delete and tombstone handling
+
+Each Debezium operation needs an explicit mapping to an Elasticsearch action.
+
+| Debezium event | Kafka record | Elasticsearch action |
+|---|---|---|
+| `c` or `r` (insert, snapshot read) | key + envelope with `after` | index by `_id` (upsert semantics) |
+| `u` (update) | key + envelope with `before` and `after` | index by `_id` with the `after` image, replacing the document |
+| `d` (delete) | key + envelope with `before`, `after` null | delete by `_id` |
+| Tombstone | key + null value | usually ignore: it exists for Kafka log compaction, not for the index |
+
+By default, Debezium emits a delete event followed by a tombstone record (a record with the same key and a null value) when `tombstones.on.delete` is true. The tombstone tells Kafka's compactor it may discard the key's earlier records. A consumer must handle the null value deliberately: crashing on a null is a classic poison-message source, and treating the tombstone as a second delete is merely wasteful. The usual rule is to act on the delete event and drop the tombstone. The unwrapping transform has its own delete-handling options (drop, keep as a record with a marker field, or emit tombstones) whose names changed across versions, so check the documentation for yours.
+
+Soft deletes deserve a decision. If the application sets `deleted_at` instead of removing rows, CDC sees an update, not a delete. The consumer must translate that into an Elasticsearch delete (or filter it out at query time) or deleted records remain searchable.
+
+### Out-of-order writes and external versioning
+
+Partition ordering protects you from reordering inside the pipeline, but not from retries. Consider a bulk request containing version 5 of a document that fails with a timeout and is retried while version 6 has already been written by another path (for example a backfill running concurrently). The retry would overwrite version 6 with version 5.
+
+Elasticsearch supports external versioning: set `version_type=external` and supply a version number, and the write is rejected with a version conflict unless the supplied version is greater than the stored one (`external_gte` accepts equal versions too). A monotonic number that comes from the source is the right choice: a value derived from the binlog position, a GTID sequence, or the source timestamp combined with a tiebreaker. The pragmatic and common option is `source.ts_ms` (millisecond resolution), with the caveat that two updates to the same row in the same millisecond would tie. Combining the log file index and position into a single integer avoids ties but only works while the connector reads from a single server lineage. Pick one scheme and test the failover path.
+
+Deletes interact with versioning in a way that bites: Elasticsearch retains the version of a deleted document for `index.gc_deletes` (60 seconds by default) so that a delayed older write is still rejected. After that window, a very late replay of an old index action for a deleted `_id` would resurrect the document. Slow consumers and long replays can exceed the window, which is one of the reasons reconciliation exists.
+
+## Delivery semantics: at-least-once, duplicates and idempotency
+
+State the guarantee precisely at each hop.
+
+- **MySQL to Debezium.** Debezium reads the log in order and resumes from a stored position. Offsets are flushed periodically, so after a crash some events are re-read: at-least-once.
+- **Debezium to Kafka.** The Connect producer writes with its configured acknowledgement settings. A retried send can duplicate a record unless idempotence is enabled, and even with idempotent producers the offset-commit gap above still produces duplicates after a restart. Kafka Connect gained exactly-once support for source connectors in Kafka 3.3 (KIP-618), which a connector must opt into; whether the Debezium version you run supports it should be verified rather than assumed.
+- **Kafka to consumer.** The consumer commits offsets after processing. If it crashes between indexing and committing, the batch is re-delivered: at-least-once.
+- **Consumer to Elasticsearch.** A timed-out bulk request may have succeeded server-side. A retry duplicates the action.
+
+Chasing exactly-once across all four hops is not the practical goal. Elasticsearch cannot participate in a Kafka transaction, so end-to-end exactly-once delivery is not available here. The workable goal is effectively-once outcomes: make every write idempotent, so applying it twice equals applying it once. The ingredients are already on the table: document `_id` equals the primary key, a full-document replace rather than a partial update, and external versioning to reject stale writes. Partial updates (scripted increments, appending to arrays) are not idempotent and should be avoided in this path.
+
+The commit-after-success consumer loop, sketched in Java with the Kafka and Elasticsearch clients (illustrative, error handling and client wiring omitted):
+
+```java
+// title: IndexingLoop.java (illustrative sketch)
+while (running) {
+    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(500));
+    if (records.isEmpty()) continue;
+
+    BulkRequest bulk = new BulkRequest();
+    for (ConsumerRecord<String, String> r : records) {
+        if (r.value() == null) continue;                  // tombstone: drop
+        Event e = parse(r.value());
+        String id = e.key();                              // primary key
+        long version = e.sourceTsMs();                    // external version
+        if (e.isDelete()) {
+            bulk.add(new DeleteRequest(index, id)
+                .versionType(VersionType.EXTERNAL).version(version));
+        } else {
+            bulk.add(new IndexRequest(index).id(id)
+                .source(e.afterAsJson(), XContentType.JSON)
+                .versionType(VersionType.EXTERNAL).version(version));
+        }
+    }
+
+    BulkResponse resp = client.bulk(bulk, RequestOptions.DEFAULT);
+    for (BulkItemResponse item : resp) {
+        if (!item.isFailed()) continue;
+        int status = item.getFailure().getStatus().getStatus();
+        if (status == 409) continue;                      // stale version: fine
+        if (status == 429 || status >= 500) retryLater(item);   // transient
+        else sendToDeadLetter(item, records);             // permanent: mapping, parse
+    }
+    consumer.commitSync();                                // only after the batch is resolved
+}
+```
+
+The structure matters more than the syntax. A version conflict (409) is a success of the safety mechanism, not an error. Transient failures are retried with backoff. Permanent failures are diverted and the batch still completes, so one bad record cannot hold up the partition.
+
+## Schema evolution and compatibility
+
+Source schemas change: columns are added, widened, renamed, dropped. Three layers must cope.
+
+**The connector.** Debezium tracks DDL it sees in the binlog and stores the table definitions in the schema history topic. This lets it parse an old binlog position with the table shape that was in force at that position, which is necessary for correct restarts and replays. That topic is critical state: losing or truncating it makes the connector unable to restart without a schema re-snapshot, so it must be a single-partition topic with unlimited retention and appropriate replication.
+
+**Kafka and the registry.** With a schema registry, each subject has a compatibility mode. Backward compatibility (consumers on the new schema can read old data) is the usual default and permits adding fields with defaults and removing optional fields. Adding a nullable column in MySQL maps to adding an optional field, which is compatible. Renaming a column appears to downstream as a removal plus an addition, which is a breaking change in most modes and needs a coordinated migration. Prefer expand-and-contract migrations on the database side: add the new column, dual-write, migrate readers, then drop the old column.
+
+**Elasticsearch.** Adding a field to a strict mapping requires a mapping update before the first document with that field arrives, otherwise the bulk item is rejected. The cleanest operational pattern is: deploy the mapping change first (additive mapping updates are allowed in place), then the database migration, then the consumer change. Changing the type of an existing field requires a new index and reindex, as described earlier. This is why the dead-letter path (next section) must exist: a schema mismatch is the most common cause of a permanent per-record failure.
+
+## Retries, dead-letter handling and poison messages
+
+Not all failures are equal, and treating them the same is the most common error-handling mistake.
+
+| Failure | Nature | Treatment |
+|---|---|---|
+| Elasticsearch 429 (rejected execution) or 503 | Transient, indicates overload | Retry with exponential backoff and jitter; reduce concurrency; do not drop |
+| Network timeout | Ambiguous, may have succeeded | Retry; idempotent writes make this safe |
+| 409 version conflict | Expected under external versioning | Ignore |
+| 400 mapping or parse failure for one document | Permanent for that record | Dead-letter with the original record and error |
+| Deserialisation failure (bad bytes, unknown schema id) | Permanent for that record | Dead-letter |
+| Cluster red, index missing | Systemic | Pause consumption, alert; do not dead-letter the whole topic |
+
+A poison message is a record that fails every time it is processed. Without isolation, a consumer that retries forever on one record stops that partition completely, and lag grows without bound behind it. A dead-letter topic breaks the loop: after a bounded number of attempts, publish the original record plus headers describing the failure (exception class, message, timestamp, source topic, partition and offset) to a dedicated topic and move on.
+
+A dead-letter queue is a promise that someone will look at it. It needs an alert on non-zero depth, a retention policy, and a replay tool that re-submits fixed records. An unwatched DLQ is data loss with extra steps, and so is routing a systemic failure (every record failing because of a down cluster) into it. Cap the DLQ rate: if more than a few percent of records in a window go to it, stop consuming and page someone, because the cause is the pipeline, not the data.
+
+If you use the Kafka Connect Elasticsearch sink connector instead of a custom consumer, the same ideas apply through its configuration: error tolerance, a dead-letter topic for conversion and transformation failures, and a separate policy for how to treat malformed documents and null values at the index stage. Property names and semantics differ between connector implementations and versions, so confirm which failures each setting actually covers. A custom consumer buys control over version handling and error classification at the price of owning the code.
+
+## Capacity: what 1,000 RPS means for a CDC pipeline
+
+The title's number is a request rate at the application. The pipeline sees something else. Four multipliers separate them, and each is a property of your application and data model, not of Debezium or Kafka.
+
+1. **Write ratio.** The share of requests that mutate the database. A read-heavy service with a 10 percent write ratio turns 1,000 requests per second into 100 write requests per second.
+2. **Rows per write.** A single request can update several rows or tables: an order insert writes the order, its line items, an audit row and an inventory counter.
+3. **Events per row change.** Normally one. But an `UPDATE` touching N rows is N events, and in a denormalised index a change to a child row may force re-indexing of the parent document, so the index-side work per event can exceed one document write.
+4. **Document amplification.** If the search document nests data from other tables, one source change can trigger several document rebuilds.
+
+The relationship is a product:
+
+`CDC events/sec = requests/sec x write ratio x row changes per write request`
+
+and the indexing demand is `CDC events/sec x index operations per event`. Illustrative arithmetic (every figure is an assumption chosen to show the shape, not a measurement):
+
+| Scenario | Req/s | Write ratio | Row changes per write | CDC events/s | Index ops per event | Index ops/s |
+|---|---|---|---|---|---|---|
+| Read-heavy catalogue | 1,000 | 5% | 1 | 50 | 1 | 50 |
+| Typical mixed service | 1,000 | 20% | 3 | 600 | 1 | 600 |
+| Write-heavy with fan-out | 1,000 | 60% | 4 | 2,400 | 2 | 4,800 |
+
+The same 1,000 RPS spans nearly two orders of magnitude of indexing demand. "Scales to 1,000 RPS" is therefore meaningless without stating the ratios. The defensible phrasing is a statement about events per second at a stated event size, validated by a benchmark you ran on your hardware. We have not run one for this article and do not claim a capacity result.
+
+### Bandwidth and sizing arithmetic
+
+A Debezium update event carries both `before` and `after` images plus source metadata, so an event is commonly around two to three times the row's size. Assume a 1 KB row and a 2.5 KB event (assumption). At 2,400 events per second, ingress to Kafka is about 6 MB/s before replication; with replication factor 3 the cluster's aggregate write is roughly 18 MB/s, plus consumer reads. For modern hardware this is modest. At these scales the binding constraints are usually not bytes but per-request overhead on the Elasticsearch side, and per-partition parallelism.
+
+The indexing side deserves its own estimate. Suppose a bulk request of 500 documents takes 250 ms end to end (assumption, strongly dependent on mappings, shard count, hardware, refresh settings and concurrent query load). One worker then sustains about 2,000 documents per second, so four workers would match the 4,800 per second scenario at 60 percent utilisation of that assumption. If the real figure is 100 ms, one worker is nearly sufficient; if it is 1 second, the same scenario needs ten workers and ten or more partitions. The point is that the answer is parametric and the parameter is measured, not guessed.
+
+Search workload is independent. Elasticsearch handles queries and indexing on the same nodes, and heavy query traffic or large aggregations lengthen bulk latency. The index's sustainable indexing rate is not a constant; it falls as query load rises. Load-test indexing under a realistic concurrent query mix.
+
+The calculator takes the four multipliers, an event size and a target indexing capacity, and outputs derived writes per second, events per second, ingress bandwidth, indexing demand and the backlog growth or drain rate. Try the three scenarios from the table, then lower indexing capacity until backlog growth turns positive.
+
+<CdcCapacityCalculator />
+
+Look at which output moves most when you change the write ratio versus the event size. Request rate and write ratio drive events per second; event size drives bandwidth; neither matters to backlog unless demand exceeds indexing capacity. When it does, the backlog grows at the difference, linearly, for as long as the mismatch persists.
+
+## Backpressure, consumer lag and indexing bottlenecks
+
+Kafka gives the pipeline a natural backpressure mechanism, and it is lag. If Elasticsearch slows, the consumer's bulk calls take longer, it polls less often, and the unconsumed backlog accumulates in Kafka, where it is cheap. MySQL and Debezium are unaffected because producing to Kafka does not depend on the downstream. This is the main architectural benefit of the log in the middle.
+
+Lag is the symptom; the cause is a throughput mismatch somewhere downstream:
+
+- **Elasticsearch write thread pool saturation.** Bulk requests receive 429 responses once the write queue is full. The right response is to back off rather than retry harder.
+- **Segment merging and refresh pressure** under sustained indexing, visible as rising indexing latency and merge times.
+- **Replica and shard count** multiplying the work per document.
+- **Under-batched requests.** Too-small bulks waste the per-request overhead. Too-large bulks consume heap and increase tail latency and retry cost on failure.
+- **Insufficient consumer parallelism.** Consumers capped by partition count, or one hot partition.
+- **Expensive transformations** inside the consumer, such as per-event database lookups to build a denormalised document, which turn the consumer into a bottleneck and reintroduce load on MySQL.
+- **Slow consumer poll loop** causing group rebalances if `max.poll.interval.ms` is exceeded while a big bulk is in flight, which compounds the problem with re-delivery and pauses.
+
+The recovery arithmetic is simple and worth internalising. If arrival rate is `a` and sustained indexing rate is `s`, the backlog changes at `a - s` per second. A temporary spike of 5 minutes at 1,000 events/s above capacity builds a backlog of 300,000 events. If steady-state headroom is only 100 events/s, that backlog takes 3,000 seconds (50 minutes) to drain. Headroom, not peak capacity, determines how fast you recover. A pipeline running at 95 percent of its capacity in steady state has effectively no ability to recover from an incident.
+
+The simulator takes an arrival rate, a per-worker indexing throughput, a batch size and a worker count, then plots the backlog over time. Try a rate above capacity and watch the slope; then add workers, or shorten the burst, to see the recovery time depend on headroom.
+
+<IndexingBacklogSimulator />
+
+You should see backlog grow linearly while arrival exceeds throughput, a drain whose slope equals the headroom after the burst ends, and a near-flat recovery when capacity barely exceeds arrival. Batch size changes the effective throughput only through the overhead-versus-latency trade-off described above, so it is not a free dial.
+
+Lag has a second face, retention. If backlog age approaches the topic's retention, records start being deleted before they are consumed, which converts a performance problem into data loss that only a snapshot or reconciliation will fix. Alert on lag age as well as lag count.
+
+## Failure modes and recovery
+
+The pipeline's failure modes are best organised by what state survives.
+
+**Connector crash or restart.** Kafka Connect restarts the task and the connector resumes from its last committed offset. Expect duplicate events; idempotent indexing absorbs them. Check the position is still within binlog retention.
+
+**MySQL failover.** With GTIDs, the connector can reconnect to a promoted replica and resume by GTID set, provided the replica has the transactions the connector has not yet consumed and the binlog is intact. Without GTIDs, the file and offset do not match the new primary, and recovery usually means a controlled re-snapshot. Test failover in a staging environment; it is the scenario least likely to work first time.
+
+**Binlog purged before the connector caught up.** The connector fails with an error about a missing position. The remedy is a snapshot (re-run initial snapshot, or snapshot mode that re-snapshots when the position is unavailable), after which the index is rebuilt or reconciled. Avoid by alerting on the connector's lag and on connector-offline duration against binlog retention.
+
+**Kafka broker loss.** With replication factor 3 and `min.insync.replicas=2`, producers continue after a single broker failure and no acknowledged record is lost. With fewer replicas, availability or durability degrades.
+
+**Consumer crash.** The group rebalances and another consumer resumes from the last committed offset. Duplicates again; idempotent writes again.
+
+**Elasticsearch outage or red index.** Bulk calls fail; the consumer should pause rather than dead-letter. Lag grows in Kafka. On recovery the consumer drains the backlog. Confirm retention is longer than the outage.
+
+**Schema history topic lost.** The connector cannot interpret old positions. Restore the topic from backup, or re-snapshot with schema recovery.
+
+**Index corruption or mapping error discovered later.** Build a new versioned index, backfill, swap the alias.
+
+### Snapshot recovery and reconciliation
+
+Treat snapshots as a standard operation, not an emergency. Two patterns:
+
+1. **Full rebuild.** Create `orders-v2`, run a snapshot into it (a second connector with its own topic prefix, or replay from a compacted topic), let streaming catch up, verify, then flip the alias. Rebuilds also deliver mapping changes.
+2. **Incremental snapshot.** Use the signalling table to request a chunked re-read of one table while streaming continues. Events from the snapshot and the live stream interleave; because both carry the row's primary key and are indexed by external version, the stale ones lose.
+
+An incremental snapshot signal looks like the following (illustrative, signal table schema and field names depend on the Debezium version):
+
+```sql
+-- title: request an incremental snapshot (illustrative)
+INSERT INTO shop.debezium_signal (id, type, data)
+VALUES ('resync-orders-001',
+        'execute-snapshot',
+        '{"data-collections": ["shop.orders"], "type": "incremental"}');
+```
+
+**Reconciliation** is the safety net for everything above that can go wrong silently: a bug in the transform, a filtered-out delete, a replay past `gc_deletes`. Because the pipeline cannot prove it has never lost an event, you verify the result independently on a schedule:
+
+- Compare row counts per table to document counts per index (a cheap, coarse check; transient differences are normal during active writes).
+- Compare primary-key ranges, or a hash of `(id, updated_at)` per range, between MySQL and Elasticsearch to localise differences without scanning everything.
+- For mismatched ranges, trigger an incremental snapshot of that table or fetch and re-index just those keys.
+
+Reconcile from a replica, outside peak hours, and treat a persistent non-zero diff as a bug to find, not noise to tolerate. The rate of corrections reconciliation makes is itself a quality metric for the pipeline.
+
+## Monitoring and alerting
+
+Instrument each stage and alert on symptoms users and operators care about rather than on every internal counter.
+
+| Stage | Signal | Why it matters |
+|---|---|---|
+| Debezium | Connector and task status; `Connected`; streaming lag (`MilliSecondsBehindSource` in the JMX metrics); queue remaining capacity; time since last event | Capture health and latency; a full queue means the producer side is slow |
+| MySQL | Binlog disk usage; oldest retained binlog vs connector position; replication user connections | The recovery boundary |
+| Kafka | Under-replicated partitions; offline partitions; topic size vs retention; request latency | Durability and replay window |
+| Consumer | Group lag per partition (count and age); poll interval; rebalance rate; bulk batch latency; DLQ rate | The primary SLI for freshness |
+| Elasticsearch | Bulk rejections (write thread pool); indexing latency; refresh and merge time; JVM heap pressure; cluster status | The usual bottleneck |
+| End to end | Freshness probe: write a heartbeat row, measure time until it is searchable | The number the business actually experiences |
+
+Practical alert design:
+
+- **Freshness SLO.** Define p99 commit-to-searchable latency (for example, "99 percent of changes searchable within 30 seconds"; pick your own) and alert on the probe breaching it for several minutes.
+- **Lag trend, not just level.** A steadily rising lag is actionable before it breaches a threshold.
+- **Retention proximity.** Alert when the oldest unconsumed record age reaches a fraction of topic retention, and when connector downtime approaches binlog retention.
+- **DLQ depth greater than zero** as a ticket, a rate above a threshold as a page.
+- **Reconciliation diff** above an agreed tolerance.
+
+The end-to-end freshness probe deserves emphasis. Component metrics can all be green while a bug prevents a particular class of change from arriving; a synthetic write observed at the other end cannot.
+
+## Security considerations
+
+A CDC pipeline copies your database's contents, including the parts you would never expose through an API, into more systems. Treat it as a data-exfiltration path to be locked down deliberately.
+
+- **Least-privilege database user.** The connector needs SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE and REPLICATION CLIENT (and sometimes LOCK TABLES, depending on snapshot locking), and nothing that allows writes. Check the exact list against your Debezium version.
+- **Transport encryption.** Enable TLS between Debezium and MySQL (the connector's SSL mode setting), between clients and Kafka brokers, and between the consumer and Elasticsearch.
+- **Authentication and authorisation.** SASL or mutual TLS for Kafka clients with ACLs scoped per topic and group; a dedicated Elasticsearch role or API key permitted to write only to the target index alias or index, not cluster-wide.
+- **Secrets.** Use Kafka Connect configuration providers or an external secret store; never put credentials in connector JSON in version control.
+- **Data minimisation.** `before` images and full rows contain more than a search index needs. Limit captured columns with column include or exclude lists, mask or hash sensitive columns at the connector, and drop fields in the consumer before indexing. Personal data in a search index and in Kafka topics extends the scope of retention, erasure and access obligations: deleting a user from MySQL does not remove their earlier records from non-compacted Kafka topics or from backups. Design the erasure story before launch.
+- **Dead-letter data.** The DLQ stores raw records, so it needs the same access controls and retention discipline as the source topics.
+- **Index access.** Elasticsearch needs authentication enabled and network exposure restricted; its query API will happily return everything it holds to an unauthenticated caller if you let it.
+
+## Operational trade-offs
+
+Some decisions have no universally right answer.
+
+**Custom consumer or sink connector.** The Kafka Connect Elasticsearch sink reduces code and reuses Connect's offset management, converters and DLQ features. A custom consumer provides full control over versioning, document construction (denormalisation, joins), error classification and batching. If the transformation is a flat one-table-to-one-index mapping, start with the connector. If you need to compose documents from multiple topics, you are writing a stream processor, and you should treat it as one.
+
+**Per-table topics versus a single topic.** Per-table preserves schema homogeneity and independent scaling. A single topic preserves cross-table ordering by key but mixes schemas. Cross-table ordering is a rarely needed property and a rarely-honoured one: transactions spanning tables are not atomic in the index regardless of how you partition.
+
+**Eventual consistency of denormalised documents.** If an order document nests customer data, a customer update must re-index every affected order. Either accept the fan-out cost, or keep the index normalised and resolve joins at query time in the application. The pipeline cannot make the index transactionally consistent with MySQL; design the product behaviour around bounded staleness.
+
+**Freshness against throughput.** Longer batches and refresh intervals raise throughput and lower cost, and raise staleness. The knobs are `linger` and batch size in the consumer and `refresh_interval` in the index. Decide the freshness requirement first, then tune within it.
+
+**Read-after-write.** A user who just saved a record and then searches may not see it yet. The options are to route that user's next read to MySQL, to return the saved object directly from the write response, or to wait for a refresh in the write path (a costly choice not suitable for the CDC path). CDC does not give you read-your-writes in the search tier.
+
+## Assumptions and limitations
+
+Stated plainly, so the reader can discount accordingly:
+
+- No benchmark was run for this article. Capacity numbers are arithmetic on stated assumptions, not measurements, and real throughput depends on mappings, shard layout, hardware, query load, network, and software versions.
+- The design assumes a single MySQL primary with row-based binary logging and a modest number of captured tables. Very large tables, extreme write rates, multi-primary topologies and sharded MySQL fleets raise different problems (single-threaded capture limits, snapshot duration, cross-shard ordering) that are not addressed here.
+- Config property names and defaults reflect the author's understanding of Debezium 1.x and 2.x, Kafka 3.x and Elasticsearch 7.x and 8.x and may differ in your versions. Snippets are illustrative.
+- External versioning schemes derived from timestamps assume source clocks and the binlog order agree closely enough; test them against failover.
+- Exactly-once is not claimed anywhere end to end; the design provides effectively-once outcomes through idempotent writes.
+- The interactive labs are simplified models for building intuition. They are not predictions of any real system's performance.
+
+## Conclusion
+
+A reliable MySQL-to-Elasticsearch pipeline is less about any single component than about three decisions made explicitly: keys that give per-entity ordering, writes that are safe to repeat, and a log that absorbs mismatches between producer and consumer. Add measured lag, a freshness probe, a dead-letter path someone reads, and a reconciliation job that proves the index still matches its source. When someone says it "scales to 1,000 RPS", ask which ratios they assumed, what the event size is, and what the index can absorb under query load. The honest answer is a table of assumptions and a benchmark, and the pipeline is only as trustworthy as that answer is specific.
