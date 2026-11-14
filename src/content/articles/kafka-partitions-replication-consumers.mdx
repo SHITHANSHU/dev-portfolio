@@ -16,7 +16,7 @@ Kafka is easiest to reason about as a distributed, append-only log. Producers ap
 
 This model gives Kafka a particular shape. A consumer can stop and resume, another consumer group can read the same retained records independently, and a slow sink can fall behind without blocking the producer immediately. But order is scoped to a partition, replay is bounded by retention, and consumer progress is only as safe as the point at which offsets are committed.
 
-This article uses Apache Kafka 4.2 documentation as the current reference for version-sensitive configuration. Core concepts apply across recent Kafka releases; defaults and APIs should be checked against the exact broker and client version. The examples are illustrative and make no performance claims.
+I use Apache Kafka 4.2 documentation as the current reference for version-sensitive configuration. Core concepts apply across recent Kafka releases; check defaults and APIs against the exact broker and client version. The examples are illustrative and I make no performance claims here.
 
 ## The main data path
 
@@ -36,7 +36,7 @@ That key also defines a scaling boundary. All records for a hot key remain in on
 
 Increasing a topic's partition count can change the default key-to-partition mapping for new records. Older records for a key remain where they were written while newer ones may go to a different partition. If consumers process both partitions concurrently, the application can observe newer state before older state. Drain before changing counts or add a version/sequence check at the destination when order across the transition matters.
 
-The partition explorer shows the key-placement and assignment trade-offs. It uses a deterministic substitute hash so it can explain the shape of the mapping without pretending to reproduce a particular client's partitioner byte for byte.
+The partition explorer shows the key-placement and assignment trade-offs. I use a deterministic substitute hash so I can explain the shape of the mapping without pretending to reproduce a particular client's partitioner byte for byte.
 
 <KafkaPartitionExplorer />
 
@@ -86,9 +86,9 @@ This is normal at-least-once behavior. Commit after the side effect succeeds, an
 
 <KafkaConsumerGroupPlayground />
 
-The lab starts with synthetic records in four partitions. Increase produce rate above processing capacity to grow the backlog. In manual mode, process records without committing and trigger recovery: the group returns to its committed positions, so uncommitted records may be seen again. Replay resets this group's offsets without deleting the topic data.
+I start the lab with synthetic records in four partitions. Increase produce rate above processing capacity to grow the backlog. In manual mode, process records without committing and trigger recovery: the group returns to its committed positions, so uncommitted records may be seen again. Replay resets this group's offsets without deleting the topic data.
 
-The simulation treats committed offset as the next record to read and defines lag as log-end offset minus committed offset. In real systems, dashboards may report consumer-position lag or committed-offset lag; both are useful, but answer slightly different questions. Kafka's [consumer-group operations guide](https://kafka.apache.org/42/operations/basic-kafka-operations/#checking-consumer-position) shows how to inspect current offsets, log ends and lag per partition.
+In the simulation I treat committed offset as the next record to read and define lag as log-end offset minus committed offset. In real systems, dashboards may report consumer-position lag or committed-offset lag; both are useful, but answer slightly different questions. Kafka's [consumer-group operations guide](https://kafka.apache.org/42/operations/basic-kafka-operations/#checking-consumer-position) shows how to inspect current offsets, log ends and lag per partition.
 
 ### Processing guarantees and transactions
 
@@ -138,7 +138,7 @@ A task queue with per-message priority, short visibility timeouts and small dela
 
 <Callout type="assumption" title="Scope">
 
-This is a design guide for Apache Kafka 4.2 concepts, with version-sensitive claims called out. Interactive labs are deterministic, synthetic models; they do not connect to a broker or emulate its protocol, timing, partitioner bytes, rebalancing algorithm or transaction coordinator. The partition explorer uses a substitute hash. The consumer playground uses four partitions and a simplified assignment. No performance figures are claimed.
+This is a design guide for Apache Kafka 4.2 concepts, and I call out version-sensitive claims. The interactive labs are deterministic, synthetic models; they do not connect to a broker or emulate its protocol, timing, partitioner bytes, rebalancing algorithm or transaction coordinator. The partition explorer uses a substitute hash. The consumer playground uses four partitions and a simplified assignment. I claim no performance figures.
 
 </Callout>
 
