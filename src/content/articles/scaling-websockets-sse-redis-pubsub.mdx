@@ -1,0 +1,499 @@
+---
+title: "Scaling WebSockets and SSE to Hundreds of Pods: Where Redis Pub/Sub Breaks and How to Fix It"
+description: "Why realtime fan-out over Redis Pub/Sub degrades as a WebSocket/SSE gateway grows to hundreds of pods: O(pods) delivery, cluster broadcast, slow-subscriber disconnects, reconnect storms, and the fixes: sharded Pub/Sub, sequence numbers with replay, room affinity, backpressure."
+date: "2026-11-12"
+status: "published"
+category: "Distributed Systems"
+tags: ["WebSocket", "SSE", "Redis", "Pub/Sub", "Scalability"]
+featured: false
+series: "Article 07"
+related: ["redis-persistence-pubsub-streams", "kafka-partitions-replication-consumers"]
+---
+
+## The problem: one Redis channel, two hundred gateway pods
+
+A product has a realtime feature: chat rooms, live dashboards, collaborative documents, notifications. A gateway Deployment terminates WebSocket or SSE connections. The first version had three pods and one Redis. Every message was a `PUBLISH events <payload>`, every pod ran `SUBSCRIBE events`, and each pod filtered the stream down to the sockets it owned. It worked, and nobody thought about it again.
+
+Now the Deployment runs 200 pods and holds two million open connections. The symptoms arrive roughly in this order:
+
+- Redis egress grows with the number of pods instead of with traffic. Doubling the fleet doubles Redis network output for the same user-visible message rate.
+- After moving to Redis Cluster, Redis CPU still saturates, because classic `PUBLISH` is forwarded to every node.
+- A pod pauses for a garbage collection, Redis closes its subscriber connection, and every user on that pod silently misses messages.
+- Every deploy or crash produces a reconnect storm that takes down the next pod.
+- Connections die every 60 seconds behind the load balancer, and SSE clients give up permanently after a single 502 during a rollout.
+
+None of these is a Redis bug. They are the documented behaviour of Pub/Sub meeting a fleet size it was not designed around. I focus here on the cost model and the failure semantics: what a connection costs, what a publish costs as pods multiply, what is guaranteed (very little), and the fixes that make Redis work proportional to interested pods instead of to all pods or all sockets.
+
+This is a design discussion drawn from the documented behaviour of these systems, not a report on a deployment. I include no measurements and no incident stories. Every number is either a documented default, with its source named, or arithmetic I label illustrative. Configuration and code are illustrative and not validated against a specific build.
+
+<Callout type="assumption" title="Version scope">
+
+Redis behaviour is described for open-source Redis 7.x (7.0 introduced sharded Pub/Sub and client eviction); later releases are believed to behave the same for the commands used here, but check what you run. Valkey is a fork and I did not separately verify it. SSE follows the WHATWG HTML Living Standard, WebSocket follows RFC 6455 (RFC 8441 for WebSocket over HTTP/2), HTTP/2 follows RFC 9113. nginx, AWS ALB and Kubernetes behaviour is as documented on 2026-11-12.
+
+</Callout>
+
+For Pub/Sub basics and Streams, see the [Redis article](/journal/redis-persistence-pubsub-streams/); here I only use `XADD`, `XRANGE` and `XREAD` from Streams. For partitioned logs, see the [Kafka article](/journal/kafka-partitions-replication-consumers/).
+
+## WebSocket and SSE are long-lived state, not requests
+
+A normal HTTP request is stateless: any pod can serve it and it ends in milliseconds. A WebSocket or SSE connection is the opposite. It pins a client to one pod for minutes or hours, and that pod now holds state: who the user is, which rooms they joined, a send queue, a heartbeat timer. Everything that makes stateless services easy to scale (round-robin, autoscaling, restart on failure) turns into a cost here.
+
+| Property | WebSocket | SSE (`EventSource`) |
+| --- | --- | --- |
+| Direction | Full duplex | Server to client; upstream goes over ordinary HTTP requests |
+| Framing | Binary or text frames after an HTTP `Upgrade` (RFC 6455) | `text/event-stream`, UTF-8 text lines |
+| Request headers | Set freely by non-browser clients; browsers cannot set custom headers on the handshake | `EventSource` cannot set custom headers, only a URL and `withCredentials` |
+| Reconnect | You build it | Built in, with `retry:` and `Last-Event-ID` |
+| Liveness | Ping/pong control frames; the browser JS API cannot send pings, so client-side liveness needs an app-level heartbeat | Comment lines (`:`); the spec advises about one every 15 s |
+| Connection limits | One socket per connection | Over HTTP/1.1 browsers cap it at 6 per browser and domain across tabs; over HTTP/2 the limit is the server's advertised `SETTINGS_MAX_CONCURRENT_STREAMS` (RFC 9113 recommends at least 100; MDN cites 100) |
+| Proxy behaviour | Needs `Upgrade` support end to end; over HTTP/2 uses extended CONNECT (RFC 8441), over HTTP/3 RFC 9220, with support varying | Plain HTTP response; breaks if a proxy buffers it |
+| Binary payloads | Native | Text only (encode it) |
+
+My opinion, which the rest of the article does not depend on: for server-to-client feeds (dashboards, notifications, progress, live scores) SSE plus ordinary HTTP POST for the upstream path is the easier system to scale. Auth, retries, load balancing and observability are all plain HTTP, and the reconnect protocol is already specified. Reach for WebSocket when the client sends a high rate of small messages, needs binary, or when you must support clients that cannot use `EventSource`.
+
+The reconnect rules in SSE have two sharp edges worth knowing now. A response with a status other than 200, or a content type other than `text/event-stream`, fails the connection and the user agent does not reconnect. And automatic reconnect uses a user-agent-defined delay: the spec says the initial value is implementation-defined, "probably in the region of a few seconds", and that agents might add exponential backoff but are not required to. You control the delay with `retry:`, which matters in the reconnect-storm section.
+
+## What one connection costs a gateway pod
+
+A pod's connection budget is bounded by boring things before it is bounded by CPU:
+
+- **File descriptors.** One per socket. The process limit (`ulimit -n`, or `LimitNOFILE` under systemd) must exceed connections per pod plus the descriptors used for upstream connections.
+- **Memory.** Kernel socket buffers, TLS session state, and the runtime's per-connection objects (a socket wrapper, a send queue, a heartbeat timer, a registry entry). The total depends on your runtime and library; I will not quote a number, and the calculator below takes it as an explicit input you must measure.
+- **Ephemeral ports behind a proxy.** If an ingress or sidecar holds one upstream TCP connection per client to one `IP:port`, it is limited by its local port range. The Linux default `net.ipv4.ip_local_port_range` is 32768 to 60999, about 28,000 ports (default on current kernels; distributions may change it).
+- **Idle timeouts on every hop.** This is the most common production surprise.
+
+### Idle timeouts and heartbeats
+
+Every proxy on the path has an idle timer, and a quiet connection looks idle. AWS ALB defaults to 60 seconds (configurable from 1 to 4000) and needs at least one byte per period; HTTP/2 PING frames do not reset it, and the application's idle timeout should exceed the load balancer's. nginx closes a proxied connection when the upstream sends nothing for 60 seconds by default (`proxy_read_timeout`); the documented fixes are a longer timeout or periodic pings.
+
+The rule is simple: heartbeat at an interval comfortably below the smallest idle timeout on the path. For WebSocket that is an application-level message (or a server-sent ping), and for SSE a comment line.
+
+```nginx
+# title: nginx.conf (WebSocket and SSE locations, illustrative)
+location /ws/ {
+    proxy_pass http://gateway;
+    proxy_http_version 1.1;               # only needed before nginx 1.29.7
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 300s;              # must exceed the heartbeat interval
+}
+location /events/ {
+    proxy_pass http://gateway;
+    proxy_buffering off;                  # or send X-Accel-Buffering: no
+    proxy_read_timeout 300s;
+}
+```
+
+```text
+# title: SSE stream with heartbeat (illustrative)
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Cache-Control: no-cache
+X-Accel-Buffering: no
+
+retry: 4000
+: keep-alive
+id: 41
+data: {"room":42,"seq":41,"body":"..."}
+
+```
+
+A buffered SSE stream is a silent failure: events arrive in bursts when a buffer flushes and the stream looks stuck. Disable buffering for the route and check that any compression middleware does not buffer either.
+
+## Routing: sticky, stateless and room-affinity
+
+The socket is pinned to a pod anyway, so what does "sticky" even mean here? Two different things.
+
+**Session stickiness** matters for transports that make several requests per session. Socket.IO documents that it needs sticky sessions when HTTP long-polling is enabled (as documented by Socket.IO; check its current docs). A pure WebSocket or SSE connection is one request and needs no stickiness at all. It does benefit from resume locality, though: a reconnect that lands on the pod that already holds the client's room subscription is cheaper than one that does not.
+
+**Room affinity** is the interesting one. Instead of spreading a room's members uniformly across pods, route by a consistent hash of the room id so that all members of a room land on the same pod or a small set of pods.
+
+```nginx
+# title: nginx upstream hashed by room (illustrative)
+upstream gateway {
+    hash $arg_room consistent;
+    server gw-0:8080;
+    server gw-1:8080;
+}
+```
+
+The payoff is large, and the capacity section quantifies it: a publish to a room reaches one pod instead of dozens. The costs are real:
+
+- **Rebalancing.** Adding or removing a pod moves about 1/P of the rooms (a standard property of consistent hashing), and their members must reconnect.
+- **Users in many rooms.** A user in 30 rooms cannot be on 30 pods. Either the user's connection goes wherever its primary room hashes and the others are subscribed over Redis, or you accept multiple connections per client.
+- **Hot rooms.** Affinity concentrates a popular room on one pod, which is exactly the opposite of what you want for its egress.
+- **Imbalance after deploys.** Hash placement and rolling restarts interact badly if reconnects do not follow the hash.
+
+Affinity is an optimization on top of interest-based subscription, not a replacement for it. A design that only works with perfect routing will fail the first time a pod restarts.
+
+## The fan-out tier: how pods learn about each other's messages
+
+A message published by one user must reach sockets held by other pods. The gateway tier needs a bus. Redis Pub/Sub is the usual first choice: no storage, tiny API, push-based, available everywhere.
+
+<Figure label="Fig 1" caption="Fan-out path and connection path. The publisher writes to a bounded replay log and then publishes; Redis pushes only to pods that subscribed to the room; each pod fans out through bounded per-client queues.">
+<FlowDiagram title="Realtime fan-out path" steps={[{label:"Publisher",sub:"room 42 event"},{label:"Sequence + buffer",sub:"XADD room:{42}:log",tone:"store"},{label:"PUBLISH",sub:"channel room:{42}"},{label:"Redis Pub/Sub",sub:"push to subscribed pods",tone:"store"},{label:"Gateway pods",sub:"only pods with room 42 members"},{label:"Per-client queue",sub:"bounded, drop policy",tone:"warn"},{label:"WS / SSE clients",sub:"dedupe by seq"}]} />
+<FlowDiagram title="Connection path" steps={[{label:"Client",sub:"WS upgrade or GET text/event-stream"},{label:"Load balancer",sub:"idle timeout 60 s default",tone:"warn"},{label:"Gateway pod",sub:"auth, join room"},{label:"Local registry",sub:"room -> connections",tone:"store"},{label:"SUBSCRIBE",sub:"first local member only"}]} />
+</Figure>
+
+The design question is who subscribes to what. There are three options, and the choice sets the cost of every publish.
+
+<Figure label="Fig 2" caption="Three subscription strategies. The number of Redis deliveries per publish is members, pods, or pods hosting the room.">
+<FlowDiagram title="Per-connection" steps={[{label:"Each socket",sub:"opens its own Redis subscription",tone:"warn"},{label:"Redis",sub:"deliveries = members; Redis clients = sockets",tone:"store"}]} />
+<FlowDiagram title="Global channel" steps={[{label:"Every pod",sub:"SUBSCRIBE events"},{label:"Redis",sub:"deliveries = pods",tone:"store"},{label:"Pod filters locally",sub:"discards most messages",tone:"warn"}]} />
+<FlowDiagram title="Per-room, pod-coalesced" steps={[{label:"First local member joins",sub:"SUBSCRIBE room:id"},{label:"Redis",sub:"deliveries = pods hosting the room",tone:"store"},{label:"Last local member leaves",sub:"UNSUBSCRIBE room:id"}]} />
+</Figure>
+
+**Per-connection subscriptions** are what you get if each socket handler calls `SUBSCRIBE` on its own Redis connection. Deliveries per publish equal the member count, and the number of Redis client connections equals the number of sockets, against a `maxclients` default of 10,000. It collapses well before the fleet is large.
+
+**A global channel** (everything on one channel, filtered locally) keeps Redis connections at one per pod, but every pod receives every message. Deliveries per publish equal the pod count, and the fraction wasted is `1 - E_pods / P`, where `E_pods` is the number of pods that actually host a member of the room.
+
+**Per-room, pod-coalesced subscriptions** are the right default. Each pod keeps a local registry from room to set of connections and holds a Redis subscription for a room only while it has at least one local member: subscribe on the first join, unsubscribe on the last leave. Deliveries per publish equal `E_pods`. One subscriber connection per pod suffices, which also matters because a RESP2 connection in subscribed mode can only issue (un)subscribe, `PING`, `QUIT` and `RESET` (RESP3 allows other commands).
+
+```typescript
+// title: gateway/rooms.ts (illustrative, refcounted subscriptions)
+type Conn = { send(frame: string): void };
+
+export class RoomRegistry {
+  private members = new Map<string, Set<Conn>>();
+  constructor(
+    private sub: { subscribe(ch: string, cb: (m: string) => void): Promise<void>; unsubscribe(ch: string): Promise<void> },
+    private deliver: (conns: Set<Conn>, msg: string) => void,
+  ) {}
+
+  async join(room: string, c: Conn) {
+    let set = this.members.get(room);
+    if (!set) {
+      set = new Set();
+      this.members.set(room, set);
+      // first local member: one Redis subscription for the whole pod
+      await this.sub.subscribe(`room:{${room}}`, (m) => this.deliver(this.members.get(room) ?? new Set(), m));
+    }
+    set.add(c);
+  }
+
+  async leave(room: string, c: Conn) {
+    const set = this.members.get(room);
+    if (!set) return;
+    set.delete(c);
+    if (set.size === 0) {
+      this.members.delete(room);
+      await this.sub.unsubscribe(`room:{${room}}`);
+    }
+  }
+}
+```
+
+Two cautions on the sketch. Concurrent `join` calls for the same room must not both subscribe, so a real version needs a pending-subscribe promise per room. And the subscribe call must complete before the join is acknowledged to the client, or messages can be missed in the window.
+
+### Channel per room, per user, or global
+
+Per-room is the natural unit for many-member messages. Per-user suits notifications but makes subscription churn track connection churn. A global channel is fine for a few pods and rare broadcasts. Never build channel names from unauthorized client input, and keep `PSUBSCRIBE` off the hot path.
+
+## Where Redis Pub/Sub breaks at hundreds of pods
+
+Everything below is documented behaviour. The surprise is how the items combine at fleet scale.
+
+**Publish cost is O(N+M).** The `PUBLISH` command's documented complexity is O(N+M), where N is the number of subscribers of the channel and M is the total number of pattern subscriptions across all clients. Every subscriber is a write on Redis's main thread, and every pattern subscription is tested on every publish. With a global channel N is the pod count. With patterns, M is a tax on every publish in the system.
+
+**At-most-once, no storage.** The Redis documentation states that a message the subscriber cannot handle (an error, a disconnect) is lost for good. Subscribers receive messages in publish order, but nothing is retained: a pod that is restarting, reconnecting or merely slow misses messages with no signal to the publisher beyond a lower receiver count. Pub/Sub is also unrelated to the keyspace and database numbers, so a publish on db 10 is heard on db 1; scope by channel name.
+
+**Cluster broadcast.** In Redis Cluster, `PUBLISH` can be sent to any node, which forwards it to every other node over the cluster bus. The returned count includes only subscribers on the node that received the publish. Every node does work for every message whether or not it has subscribers, so adding shards adds nothing to publish capacity. Sharded Pub/Sub (next section) exists to fix this.
+
+**Slow-subscriber disconnects.** Redis buffers outgoing messages per client in an output buffer. The default `client-output-buffer-limit pubsub 32mb 8mb 60` closes the connection if the buffer exceeds 32 MB, or stays above 8 MB for 60 seconds, and logs it. In a coalesced design that connection is the whole pod's subscription, so one stall costs every user on the pod. Lab 3 below shows how fast that happens.
+
+**Dead subscribers linger.** The `timeout` setting does not apply to Pub/Sub clients, so an idle-timeout does not reap a vanished pod. If the node dies without a FIN, an idle subscriber is reaped only by TCP keepalive (default 300 s; on Linux redis.conf says closing takes about twice that). A subscriber that is still being pushed messages has unacknowledged data in flight, so keepalive does not help; what closes it is the output-buffer limit (8 MB for 60 s, or 32 MB). `maxmemory-clients` (7.0, default 0, off) is a ceiling on total client memory; the Redis docs suggest a non-zero value for large deployments.
+
+**Resubscribe storms.** After a Redis failover, every pod reconnects and resubscribes every channel at once. With 1.8 million room subscriptions (the worked example below), that is a burst of `SUBSCRIBE` traffic landing on a freshly promoted node. Jitter and batch the resubscribe.
+
+**No parallelism.** There is no consumer-group equivalent. One channel lives on one process, so the publish rate of one room is bounded by one Redis thread, and the delivery rate of one room is bounded by the pods hosting it.
+
+## Sharded Pub/Sub in Redis 7
+
+Redis 7.0 added `SPUBLISH` and `SSUBSCRIBE`. The channel name is hashed to a slot with the same algorithm as keys, and the message is propagated only within the shard that owns the slot (its primary and replicas), not to the whole cluster. Publish handling then splits by shard instead of repeating on every node, and Pub/Sub volume scales by adding shards. A subscriber can subscribe on the primary or on any replica of the owning shard, which lets you spread delivery work across replicas.
+
+<Figure label="Fig 3" caption="Sharded publish. Only the owning shard handles the message; a pod subscribed on a replica of that shard receives it from there.">
+<SequenceDiagram title="Sharded publish" actors={["Publisher","Shard 2 primary","Shard 2 replica","Pod 17"]} messages={[{from:"Publisher",to:"Shard 2 primary",label:"SPUBLISH room:{42}",note:"other shards do no work"},{from:"Shard 2 primary",to:"Shard 2 replica",label:"propagate within shard",dashed:true},{from:"Shard 2 replica",to:"Pod 17",label:"smessage",note:"Pod 17 SSUBSCRIBEd on this replica",dashed:true}]} />
+</Figure>
+
+The costs and rules:
+
+- All channels in one `SSUBSCRIBE` call must hash to the same slot, and a call to the wrong node can return `-MOVED`. A pod therefore holds a subscriber connection per shard it listens to, at most `P x S` across the fleet.
+- Shard channel names follow the same slot algorithm as keys, so hash tags should apply: `room:{42}` and its replay stream `room:{42}:log` would land in the same slot. This follows from the documented "same algorithm as keys" and I did not separately verify it; you can confirm it with `CLUSTER KEYSLOT` on your version before relying on it.
+- When a slot migrates, subscribers of shard channels in that slot are dropped by the node that lost it and must resubscribe on the new owner. Client libraries generally handle the move (node-redis exposes an event for it), but treat the exact behaviour as something to test, and design for a gap and replay.
+- A hot channel is a hot shard. Sharded Pub/Sub moves the ceiling from "one process for everything" to "one process for the hottest channel".
+- Semantics otherwise do not change: at-most-once, nothing stored.
+
+```typescript
+// title: sharded subscribe (node-redis style, illustrative)
+import { createCluster } from "redis";
+
+const cluster = createCluster({ rootNodes: [{ url: "redis://redis-0:6379" }] });
+await cluster.connect();
+
+// subscribe: the client routes by slot; check how your client version handles a slot move
+await cluster.sSubscribe("room:{42}", (message) => fanOutToLocalMembers("42", message));
+
+// publish from anywhere
+await cluster.sPublish("room:{42}", JSON.stringify({ seq: 48, body: "hi" }));
+```
+
+Socket.IO's Redis adapter also offers a sharded mode (its README documents a `createShardedAdapter()` using Redis 7 sharded Pub/Sub with a `subscriptionMode` option). If you use Socket.IO, check the adapter version you run, since I do not rely on version specifics here.
+
+## Capacity model: where the bottleneck moves as pods grow
+
+The unit of scale is split. The gateway pod scales connections and client egress. The fan-out tier scales deliveries per publish. They scale differently, and the main point I want to make is that adding pods increases Redis work unless subscriptions are interest-based and routing concentrates rooms.
+
+**Symbols.**
+
+- `P` pods; `C` total client connections; `N` rooms; `M` members per room, with one room per client so `C = N x M`
+- `R` publishes per second across all rooms (msgs/s); `B` payload bytes per message (decimal, kB = 1000 B)
+- `S` Redis primaries; `r` replicas per primary; nodes `= S x (1 + r)`
+- `E_pods` expected number of pods hosting at least one member of a room
+
+**Formulas.**
+
+| Quantity | Formula | Unit |
+| --- | --- | --- |
+| `E_pods`, random placement | `P x (1 - (1 - 1/P)^M)` | pods |
+| `E_pods`, room affinity | `min(P, ceil(M / connsPerPod))` | pods |
+| Deliveries per publish `d` | per-connection `M`; global `P`; per-room coalesced `E_pods` | deliveries |
+| Redis egress | `R x d` and `R x d x B` | msgs/s, bytes/s |
+| Per-pod Redis ingress | `R x d / P` | msgs/s |
+| Wasted fraction, global channel | `1 - E_pods / P` | ratio |
+| Client egress (all strategies) | `R x M` total, `R x M / P` per pod | msgs/s |
+| Classic `PUBLISH` in Cluster | per-node handling `R`; cluster-bus forwarding about `R x (nodes - 1)` | msgs/s |
+| Sharded `SPUBLISH` | per-shard handling `R / S` (uniform hashing); intra-shard propagation about `R x r` | msgs/s |
+| Subscriber connections | per-connection `C`; coalesced standalone about `P`; sharded up to `P x S` | connections |
+| Channel subscriptions in Redis | `N x E_pods` | subscriptions |
+| Pod connection memory | `(C / P) x memPerConnBytes`, where `memPerConnBytes` is an input you must measure | bytes |
+
+**Worked example (illustrative arithmetic, not a measurement).** `P = 200`, `N = 50,000`, `M = 40` (`C = 2,000,000`, 10,000 per pod), `R = 20,000` msgs/s, `B = 500` B.
+
+| Design | Redis deliveries/s | Redis egress | Notes |
+| --- | --- | --- | --- |
+| Global channel | 4,000,000 | 2.0 GB/s | Each pod ingests 20,000 msgs/s and discards about 82% |
+| Per-room, coalesced, random placement | about 727,000 | about 363 MB/s | `E_pods` is about 36.3; about 1.8 million channel subscriptions held in Redis |
+| Per-room, coalesced, room affinity | 20,000 | 10 MB/s | `E_pods` is 1 |
+
+Client egress is the same in all cases: 800,000 msgs/s and 400 MB/s in total, 4,000 msgs/s and 2 MB/s per pod. That is the floor; no design reduces it. Everything above it is overhead.
+
+Cluster numbers for the same load, with 6 primaries and 1 replica each (12 nodes): classic `PUBLISH` makes every node handle all 20,000 publishes per second and forwards about 220,000 msgs/s over the cluster bus, while sharded publish makes each primary handle about 3,333 per second with about 20,000 msgs/s of intra-shard propagation.
+
+**Large rooms defeat placement.** With `M = 500` random placement touches about 184 of 200 pods; with `M = 5,000` it touches essentially all 200. Big rooms reach every pod whatever the strategy, so only coalescing (one delivery per pod rather than per member) and channel partitioning help.
+
+**Where the bottleneck moves as the fleet grows.** First client egress and per-pod connection limits. Then, with a global channel or random placement, Redis egress and wasted per-pod ingress grow linearly with `P` on one Redis thread. Classic Cluster `PUBLISH` gives no relief, since every node handles every message. Sharded Pub/Sub splits publish handling by shard, leaving the hottest channel's shard and resubscribe storms as limits. Room affinity brings Redis egress close to `R`, and the limits become hot rooms, rebalancing (about 1/P of rooms move) and post-deploy imbalance.
+
+**Hot-room partitioning.** When one room spans every pod, split its channel into `k` sub-channels with no shared hash tag (`room:42:p0` to `room:42:p{k-1}`, so they hash to different slots; a shared `{42}` tag would put them all in one slot and defeat the point). Each pod subscribes to one sub-channel chosen by `hash(podId) mod k`, and the publisher sends `k` copies. You trade `k` times the publishes for `1/k` of the per-shard delivery work. It is worth it only when delivery, not publishing, is the bottleneck for that room. The sub-channels no longer share a slot with the room's log, so publish the copies outside any single-slot script.
+
+**Limits of horizontal scaling.** One channel lives on one shard, so one room's publish rate is bounded by one Redis process. One room's delivery is bounded by the pods that host it. Pub/Sub has no consumer-group parallelism.
+
+Try the calculator with the worked example loaded by default. Switch the strategy from per-room to global and watch deliveries multiply by the pod count and the hatched cells appear; then switch routing to room affinity and watch the sample shrink to one cell. Move to a cluster topology and compare classic with sharded on the cluster-bus bar. Finally switch back to round-robin and raise members per room to 5,000, then to 100,000 with affinity: random placement touches about 200 of 200 pods, while affinity spreads a room only once it exceeds one pod's (illustrative, 50,000-connection) capacity.
+
+<RealtimeFanoutCalculator />
+
+What you should have seen: the global channel costs `P` times the traffic regardless of interest, per-connection subscriptions blow through `maxclients` long before anything else, coalescing brings Redis work down to the number of pods that host the room, and affinity brings it to about one pod until a room outgrows a pod. Client egress per pod never moved. The bottleneck tag is a relative ranking against arbitrary reference scales, not a capacity estimate: use your own measurements for limits.
+
+## Adding replay: sequence numbers, Last-Event-ID and a Streams buffer
+
+Pub/Sub is a doorbell. If a client must not silently miss messages, history has to live somewhere else and the client has to be able to ask for what it missed. The standard shape:
+
+1. **A dense per-room sequence** from a single authority: an `INCR` counter per room, so gaps are detectable as `seq != last + 1`. (Redis Stream IDs are `<ms>-<seq>`, strictly increasing but not consecutive, so they cannot reveal a gap on their own.)
+2. **A bounded replay buffer** per room: a Stream `room:{42}:log` whose entries use the counter as an explicit ID (`<seq>-0`), trimmed with `MAXLEN ~ N`. Size `N` as publish rate for the room times the longest outage you want to bridge (illustrative: 5 msgs/s for 10 minutes is 3,000 entries).
+3. **Atomic sequence, write and publish.** `INCR`, `XADD` and the publish must run as one unit (a Lua script or Redis Function), otherwise two publishers can draw seq 5 and 6 and publish 6 first, and clients see a false gap and then discard the real 5 as a duplicate. In Cluster the counter, the log and the channel share the `{42}` hash tag, so one script can touch all three; whether a shard publish is permitted inside a script on your version is something I did not verify, so test it.
+4. **Gap detection on the client.** Remember the last `seq` per room. `seq == last + 1` is normal; a larger value means a miss, so resume or resync. Values at or below the last seen are duplicates and dropped.
+5. **Resume on reconnect.** SSE sends `Last-Event-ID` on an automatic reconnect; for a recreated `EventSource` or a WebSocket the client sends its last `seq` itself, in a query parameter or the first message. The server should accept both the header and the parameter.
+6. **Resync when the gap exceeds the buffer.** If the requested `seq` is older than the first entry in the log, send a signal (`event: resync`) and let the client refetch a snapshot from the durable source.
+
+```json
+{
+  "room": "42",
+  "seq": 48,
+  "ts": 1731312000123,
+  "type": "message",
+  "body": { "text": "hello" }
+}
+```
+
+(Illustrative envelope. `ts` also lets you measure publish-to-deliver latency.)
+
+<Figure label="Fig 4" caption="SSE reconnect after a pod drain. The new pod subscribes first, then reads history, then merges and dedupes by sequence.">
+<SequenceDiagram title="SSE reconnect with Last-Event-ID and replay" actors={["Client","LB","Pod A","Pod B","Redis"]} messages={[{from:"Client",to:"LB",label:"GET /rooms/42/events",note:"Accept: text/event-stream"},{from:"LB",to:"Pod A",label:"forward"},{from:"Pod A",to:"Client",label:"200 text/event-stream",note:"retry: 3000-6000 (jittered)",dashed:true},{from:"Pod A",to:"Client",label:"id: 41 data: ...",dashed:true},{from:"Pod A",to:"Pod A",label:"SIGTERM, drain",note:"closes stream"},{from:"Client",to:"LB",label:"GET ... Last-Event-ID: 41",note:"after retry delay"},{from:"LB",to:"Pod B",label:"forward"},{from:"Pod B",to:"Redis",label:"SSUBSCRIBE room:{42}",note:"before reading history"},{from:"Pod B",to:"Redis",label:"XRANGE room:{42}:log (41-0 +"},{from:"Redis",to:"Pod B",label:"42..47",dashed:true},{from:"Pod B",to:"Client",label:"id: 42 ... id: 47, then live",note:"drop live dupes with seq <= 47",dashed:true}]} />
+</Figure>
+
+**Order matters.** Subscribe first, then read history, then merge and dedupe by `seq`. If you read history first and subscribe second, a message published between the two is in neither: not in the range you read, not delivered live. Subscribing first can only produce duplicates, which the `seq` check removes. In Redis terms the range read uses an exclusive start (`XRANGE key (41-0 +`, the `(` prefix requires Redis 6.2 or later). Read the history from the primary: a replica's live message and its replicated log entry travel separately, so a replica can show one before the other. The flow is the same with classic `SUBSCRIBE`/`PUBLISH` or the sharded pair; Fig 1 shows the classic names and the example below the sharded ones.
+
+```lua
+-- title: publish.lua (illustrative; run as EVAL or a Redis Function, sharded Cluster)
+-- KEYS[1]=room:{42}:seq  KEYS[2]=room:{42}:log  KEYS[3]=room:{42}  ARGV[1]=maxlen  ARGV[2]=body
+local seq = redis.call('INCR', KEYS[1])
+redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[1], seq .. '-0', 'body', ARGV[2])
+redis.call('SPUBLISH', KEYS[3], cjson.encode({ seq = seq, body = ARGV[2] }))
+return seq
+```
+
+```bash
+# title: reconnecting pod, after SSUBSCRIBE is confirmed (illustrative)
+redis-cli XRANGE 'room:{42}:log' '(41-0' +
+```
+
+The replay buffer inherits the Streams guarantees from the [Redis article](/journal/redis-persistence-pubsub-streams/): replication is asynchronous, so a failover can lose recent entries, and approximate trimming with `~` removes whole nodes, not exact counts. This is a bounded convenience buffer for catching up, not a system of record; the snapshot source is.
+
+**An alternative: pull instead of push.** Pods can skip Pub/Sub and `XREAD BLOCK` the room streams directly. Replay is then built in and ordering is the log's. The costs: in Cluster a multi-key `XREAD` needs all keys in one slot, so a pod needs roughly one blocking connection per slot group (about the shard count) and must regroup keys as rooms are joined and left and delivery latency bounded by the read loop. It trades the doorbell's push latency for simplicity of guarantees, and it is the right choice when most rooms need replay anyway.
+
+## Reconnect storms and graceful drains
+
+One reconnect is not cheap: a TCP and TLS handshake, authentication, the upgrade or stream open, a room subscription, a history read, and perhaps a snapshot fetch. A crash or a deploy makes thousands of clients attempt that at the same moment, because they all lost their connection at the same moment. If the pods that absorb them are already near capacity, they miss health checks, get killed, and the next batch of clients reconnects into a smaller fleet. The loop feeds itself.
+
+### Backoff with full jitter
+
+The fix on the client is exponential backoff with full jitter, a technique documented in the AWS Architecture Blog's "Exponential Backoff And Jitter" (Marc Brooker, 2015): pick the delay uniformly between zero and an exponentially growing, capped ceiling. It spreads retries instead of synchronizing them.
+
+```typescript
+// title: client/reconnect.ts (illustrative)
+export function nextDelayMs(attempt: number, baseMs = 500, capMs = 30_000): number {
+  const ceiling = Math.min(capMs, baseMs * 2 ** attempt);
+  return Math.floor(Math.random() * ceiling); // full jitter
+}
+
+function connect(room: string, attempt = 0, lastId = "") {
+  const q = lastId ? `?lastEventId=${encodeURIComponent(lastId)}` : "";
+  const es = new EventSource(`/rooms/${room}/events${q}`);
+  es.onmessage = (e) => { lastId = e.lastEventId; attempt = 0; };
+  es.onerror = () => {
+    // EventSource gives up for good on a non-200 or wrong content type: recreate it ourselves.
+    // A new object starts with an empty last event ID, so pass the resume point explicitly.
+    if (es.readyState === EventSource.CLOSED) {
+      setTimeout(() => connect(room, attempt + 1, lastId), nextDelayMs(attempt));
+    }
+  };
+}
+```
+
+For SSE the server can also randomize the delay: sending `retry:` with a different value per connection (say between 3,000 and 6,000 ms) desynchronizes the automatic reconnects the browser performs. Because the spec makes backoff optional for user agents, do not rely on the browser to be polite.
+
+The non-200 trap deserves emphasis. If the load balancer or a pod returns 502 or 503 during a rollout, a native `EventSource` stops reconnecting permanently. The client code above checks `readyState === CLOSED` and rebuilds, passing its last event ID as a query parameter because a fresh `EventSource` sends no `Last-Event-ID` header. On the server side, keep the pod serving until the load balancer has stopped routing to it, so new stream requests never see a 502. To shed load on SSE, accept with 200, send a larger jittered `retry:` and end the stream; a 204 or an error status ends reconnection for good. One `EventSource` per room also hits the HTTP/1.1 limit of 6 at the seventh room, so multiplex a user's rooms onto one stream (with a composite resume token in the event `id`) or require HTTP/2.
+
+### Graceful drain
+
+<Figure label="Fig 5" caption="Drain sequence for a rolling deploy. The endpoint is marked terminating asynchronously while the pod keeps serving, then the pod stops accepting new upgrades, sheds connections in batches, and exits before Kubernetes kills it.">
+<FlowDiagram title="Graceful drain on rolling deploy" steps={[{label:"SIGTERM",sub:"termination begins",tone:"warn"},{label:"Endpoint marked terminating",sub:"async; LB catches up during preStop sleep"},{label:"Stop accepting upgrades",sub:"new streams go elsewhere"},{label:"Close in batches",sub:"WS 1001 or 1012; SSE end stream",tone:"store"},{label:"Clients reconnect",sub:"with jitter"},{label:"Pod exits",sub:"before grace period ends"}]} />
+</Figure>
+
+On Kubernetes, deleting a pod marks its endpoint terminating (not ready) when the deletion timestamp is set, concurrently with the `preStop` hook and `SIGTERM`, and the pod gets `terminationGracePeriodSeconds` to exit; the documented default is 30 seconds (see the pod termination section of the Kubernetes docs; confirm on your cluster). Closing 10,000 connections in 30 s sends about 333 reconnects/s into the rest of the fleet; spreading them over 120 s cuts that to about 83/s (illustrative arithmetic), so raise the grace period deliberately and keep the drain window inside it.
+
+Three details that save pain:
+
+- Keep accepting for a few seconds (a `preStop` sleep), then stop accepting new upgrades and keep serving existing connections until you close them. Endpoint changes reach the load balancer with a delay, so new connections still arrive after `SIGTERM`.
+- Close in batches over the drain window, with a close code that tells clients to come back: 1001 ("going away", RFC 6455), or 1012 ("service restart") and 1013 ("try again later") from the IANA WebSocket close code registry. Code 1006 is reserved and never sent on the wire; it is what a client reports locally when the connection drops without a close frame.
+- A rolling restart can leave pods unevenly loaded, because the last restarted pod has fewer connections. Periodically asking a small fraction of clients on overloaded pods to reconnect rebalances without a deploy.
+
+Try this next. Trigger a crash of pod 3 with immediate retry and an accept limit of 3 connections per pod per tick, and look at the attempts bar. Then switch to backoff with jitter and compare peak attempts and ticks to reconnect. Turn the replay buffer off and watch the lost-messages counter, then shrink the buffer to 2 and watch full resyncs appear. Finally run the rolling deploy and read the imbalance ratio.
+
+<ReconnectStormPlayground />
+
+What you should have seen: immediate retry sends every disconnected client back in the next tick, so peak attempts equal the number of clients the pod held and the accept limit rejects some; jitter trades a longer tail for a lower peak. The replay buffer decides whether missed messages are replayed, require a full resync (when the gap exceeds the buffer), or are simply lost. A drain produces a gentle trickle because the pod itself paces the closes, and a rolling deploy keeps the fleet churning for the whole rollout. The lab is a toy with abstract ticks; its point is the shape of the curves, not the numbers.
+
+## Backpressure: slow clients, slow pods and drop policies
+
+There are two buffers in the path, and they fail differently.
+
+1. **Redis to pod.** The per-client output buffer on the Redis side of the subscriber connection, bounded by `client-output-buffer-limit pubsub`. When it overflows, Redis disconnects the pod.
+2. **Pod to client.** The send queue for each socket. If it grows without a bound, the process runs out of memory; if it is shared, one slow client stalls everyone.
+
+The rule that follows is to keep the subscriber loop non-blocking. The code that receives a Redis message must do nothing slow: it appends to each member's bounded queue and returns. If it writes synchronously to each socket in order, a single client with a full TCP window makes the loop wait, the Redis buffer grows, and a slow client has become a pod-wide outage.
+
+| Policy | Behaviour | Good for | Cost |
+| --- | --- | --- | --- |
+| Drop oldest | Queue is bounded; oldest message is discarded when it is full | Streams where the latest state matters | Gaps, which the client detects by `seq` and repairs by resume |
+| Keep latest per key (coalesce) | A newer message for the same key replaces the queued one | Presence, cursors, prices | Intermediate states are never seen |
+| Disconnect and resume | Slow client is closed; it reconnects and replays from its `seq` | Chat and anything ordered | Reconnect cost, and a client that is permanently slow loops |
+| Block | Wait for the slow client | Nothing at this scale | Head-of-line blocking of the pod; never use it |
+
+Tuning `client-output-buffer-limit pubsub` is a trade-off, not a fix. A larger limit buys time for a stalled pod to recover but costs Redis memory per slow subscriber, multiplied by every pod that stalls at once. `maxmemory-clients` bounds the total. The durable fix is the pod-side queue policy, so Redis never sees a slow consumer.
+
+Try the explorer with its defaults first: a slow client at 50 msgs/s on a shared in-order loop against 2,000 msgs/s incoming. Note when the buffer crosses the soft and hard limits and what the pod loses. Then switch to per-client drop-oldest and watch the buffer stay empty. Set the pod stall to 20 s and compare how the policies behave. Lower the hard limit and see which limit fires first.
+
+<SlowSubscriberExplorer />
+
+What you should have seen: with shared writes, the pod drains no faster than its slowest client, so a modest rate difference fills the buffer in seconds and Redis disconnects the pod, losing messages for every client on it, repeatedly if the condition persists. With per-client queues, the damage is confined to the client that cannot keep up. A pod stall is a different failure and per-client queues do not prevent it: the pod is not reading from Redis at all, so only a short stall survives under the defaults. The lab uses MiB consistently; Redis's `mb` units are 1024 x 1024 bytes.
+
+## Failure modes and recovery
+
+Each row is covered in detail in the section named last; the guarantee is at-most-once throughout, so every recovery path ends in resume by `seq` or a snapshot resync.
+
+| Failure | What happens | Mitigation |
+| --- | --- | --- |
+| Gateway pod crash | Sockets close, Redis drops its subscriptions; messages in the gap are lost | Jittered reconnect, resume from `seq`, snapshot if the gap exceeds the buffer (replay) |
+| Node vanishes without a FIN | Idle subscriber waits for keepalive; a busy one is closed by the output-buffer limit | App-level heartbeat, `maxmemory-clients` (Redis tier) |
+| Redis failover | Subscriber connections drop and every pod resubscribes at once; in-flight messages lost | Resubscribe with backoff, replay (the log is subject to async replication loss) |
+| Sharded slot migration | Subscribers of that slot are dropped and resubscribe; a stale call can return `-MOVED` | Expect a gap, test your client version, replay (sharded Pub/Sub) |
+| Slow pod | Output buffer passes the limit, Redis disconnects the pod, everyone on it loses messages | Non-blocking subscriber loop, alert on `omem` (backpressure) |
+| Slow client | With shared in-order writes it becomes the slow-pod case | Per-client bounded queues (backpressure) |
+| Reconnect storm | Synchronized retries overload the remaining pods | Full jitter, server `retry:`, admission limits, batched drains (storms) |
+| Hot room | The channel becomes a broadcast; one shard carries it | Partition the channel, coalesce, dedicated tier (capacity) |
+| Replay window exceeded | The client's `seq` is older than the log | `resync` signal, snapshot fetch (replay) |
+| Idle timeout shorter than heartbeat | Quiet connections drop in a wave every minute | Heartbeat below the smallest timeout (connection cost) |
+| SSE buffered by a proxy | Events arrive in bursts | `proxy_buffering off` or `X-Accel-Buffering: no` (connection cost) |
+| `PSUBSCRIBE` on the hot path | Every publish pays for every pattern | Exact channel names (Pub/Sub limits) |
+
+## When Redis Pub/Sub is the wrong fan-out tier
+
+Redis Pub/Sub is the right choice when the loss of a message is tolerable or repaired elsewhere, when you already run Redis, and when channels are many and short-lived. It is the wrong choice when you need the bus itself to provide durability or ordering across consumers, or when channel cardinality and fan-out volume make Redis the bottleneck.
+
+- **NATS.** Core NATS is also at-most-once, with subject-based interest routing across a cluster, so it suits the same role with different scaling properties; JetStream adds persistence and replay. I make a qualitative comparison only, with no throughput claims.
+- **Kafka.** Durable, partitioned, with consumer groups (see the [Kafka article](/journal/kafka-partitions-replication-consumers/)). It is a poor fit for per-room ephemeral channels (a topic or partition per room does not scale) and a good fit as the source of record that feeds the gateways, which then do the interest-based fan-out.
+- **Managed realtime services.** They take the connection tier off your hands, and the trade is cost and control. Evaluate on the same axes: replay, channel cardinality, ordering.
+
+The decision is driven by replay requirements, channel cardinality and operations budget, not by which one is fastest. The performance claims people make about any of these are workload-specific; measure yours.
+
+## Operations: metrics and alerts that matter
+
+| Tier | Metric | Why it matters |
+| --- | --- | --- |
+| Gateway | Connections per pod and imbalance (max/mean) | Fleet balance; catches post-deploy skew and affinity hot spots |
+| Gateway | Connect and disconnect rate by close code and reason | Separates deploys, crashes, idle timeouts and abuse |
+| Gateway | Reconnect attempts per second | The storm detector; alert on a sudden multiple of the baseline |
+| Gateway | Per-client queue depth and drops | Early sign of slow clients before Redis feels it |
+| Gateway | Seq gaps detected, and resync rate | Direct measure of lost messages as clients experience them |
+| Gateway | Publish-to-deliver latency (timestamp in the envelope) | The user-visible number |
+| Gateway | Event-loop lag (or equivalent) | A blocked subscriber loop is how slow pods happen |
+| Redis | Pub/Sub client `omem` from `CLIENT LIST` | Output buffers growing toward the limit |
+| Redis | Disconnects caused by the output-buffer limit (they are logged) | Each one is a pod-wide loss event |
+| Redis | `PUBSUB NUMSUB` and `PUBSUB SHARDNUMSUB` | Subscriber counts per channel, to see skew |
+| Redis | Connected clients versus `maxclients` | Per-connection designs hit this first |
+| Redis | CPU of the hottest shard | Sharding raises the ceiling to the hottest channel |
+| Load balancer | Idle-timeout closes; 5xx on upgrade | Misconfigured timeouts and drain errors |
+
+Alert on rates and ratios, not absolute connection counts: reconnect rate over baseline, seq-gap rate, and any output-buffer disconnect in Redis. The last one should never be silent.
+
+## Security considerations for long-lived connections
+
+- **Authenticate at the upgrade or stream open.** The handshake is the only request you get.
+- **Do not put long-lived credentials in the URL, or in `Sec-WebSocket-Protocol`.** (Browsers can set that header, which is why it gets abused to carry tokens; it is logged and echoed too.) `EventSource` cannot set headers, so tokens end up in query strings, which get logged by proxies and servers. Use cookies, or a short-lived single-use ticket obtained over an authenticated request and redeemed on connect.
+- **Check `Origin` for WebSocket.** Browsers do not apply CORS to WebSocket handshakes, so the server must validate `Origin` to prevent cross-site WebSocket hijacking (RFC 6455, origin considerations).
+- **Authorize every room join server-side.** Never subscribe to a channel name supplied by the client verbatim; map the client's request to a room it is allowed to read.
+- **Handle token expiry.** A connection that lives for hours outlives its token. Re-authenticate with an in-band message or force a reconnect before expiry.
+- **Cap resources.** Per-user and per-IP connection limits, maximum frame sizes, and inbound message rate limits on the pod.
+- **Scope Redis permissions.** Redis ACLs support channel rules (`&room:*`), and `acl-pubsub-default resetchannels` is the default in 7.0, so a service only gets the channel patterns it is granted.
+
+## Choosing a design
+
+| Situation | Transport | Routing | Bus | Subscription strategy | Resume |
+| --- | --- | --- | --- | --- | --- |
+| Small fleet (a few pods) | Either | Round-robin | Standalone Redis Pub/Sub | Global channel is fine | Client refetch |
+| Fleet of hundreds of pods | SSE or WS | Round-robin plus coalescing, or room affinity | Sharded Pub/Sub (Redis 7+) | Per-room, pod-coalesced | `seq` plus Streams buffer |
+| Hot rooms | WS or SSE | Affinity does not help; spread | Sharded, partitioned channel | Sub-channels per room, coalesced | `seq` plus snapshot |
+| Replay required | Either | Any | Streams as the source, Pub/Sub as the doorbell, or NATS JetStream | Per-room | `Last-Event-ID` or `seq` |
+| Mostly server to client | SSE | Round-robin | Any of the above | Per-room, coalesced | Native `Last-Event-ID` |
+
+## Assumptions and limitations
+
+<Callout type="assumption" title="Scope and simplifications">
+
+Redis behaviour is for open-source Redis 7.x; I did not separately verify Valkey. SSE follows the WHATWG HTML Living Standard, WebSocket RFC 6455 (RFC 8441 for HTTP/2), HTTP/2 RFC 9113; ALB, nginx and Kubernetes behaviour is as documented on 2026-11-12. I include no benchmarks. All capacity numbers are illustrative arithmetic, and the labs are simplified models: abstract ticks, uniform placement and rates, no real network, no kernel buffers. I hedge the items I did not verify: the Kubernetes 30 s termination default on your cluster, sharded-channel behaviour during slot migration, hash tags on shard channels, and Socket.IO adapter specifics. Multi-region active-active fan-out is out of scope: a single Redis fan-out tier does not span regions, and bridging them reintroduces ordering and duplication questions I do not answer here.
+
+</Callout>
+
+## Conclusion
+
+Scaling realtime to hundreds of pods is mostly a matter of arithmetic you can do on a napkin: Redis work should scale with the pods that have an interested member, not with all pods and not with all sockets. Treat Pub/Sub as a doorbell that is allowed to fail, keep history in a log with sequence numbers, and design reconnect as the normal path, because at this scale something is always restarting.
