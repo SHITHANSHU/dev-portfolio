@@ -12,7 +12,7 @@ related: ["cdc-mysql-debezium-kafka-elasticsearch", "iot-mqtt-kafka-ksqldb-mongo
 
 ## Why camera settings are an architecture problem
 
-An IP camera is a small embedded computer with a lens attached. It captures light, processes it into an image, compresses that image with a hardware encoder, and serves the result over the network. Everything downstream, from recorder disks to GPU decoders to the accuracy of a licence plate reader, is a consequence of a handful of settings on that device: resolution, frame rate, codec, bitrate mode, keyframe interval and which stream profile you pull.
+Everything downstream of an IP camera, from recorder disks to GPU decoders to the accuracy of a licence plate reader, is a consequence of a handful of settings on that device: resolution, frame rate, codec, bitrate mode, keyframe interval and which stream profile you pull.
 
 Those settings are usually chosen by whoever mounts the camera, using the vendor web UI, with a view to how the live picture looks. The people who pay for the choice are different: the platform team sizing storage and network, and the analytics team wondering why plate recognition fails at night. I follow the stream from sensor to inference so that you can reason about those trade-offs, not guess them.
 

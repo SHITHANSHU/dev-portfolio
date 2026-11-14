@@ -71,6 +71,7 @@ Components available without imports: `Callout` (note|warning|assumption), `Figu
 
 Writing rules:
 - **Voice: first person singular.** Write as the author ("I use…", "I chose…", "my lab shows…"); address the reader as "you". No third-person or impersonal narration about the article or author ("This article…", "the author…", "we", "let's"). First person never licenses invented anecdotes: experience claims still come only from the writer brief/resume.
+- **No obvious definitions.** Readers are engineers. Never open with or pad in "what X is" for things they already know (what a camera, queue, cache or database is). Start at the non-obvious mechanism. Background that only some readers need (a protocol detail, an acronym's internals, a prerequisite concept) goes in a collapsed `<Details summary="…">` box the reader can click, never inline. Add one only if it is not obvious; most articles need zero to three.
 - Experienced-engineer audience. Precise, opinionated about trade-offs, zero filler, no repeated conclusions.
 - Never invent production numbers, benchmarks, incidents or customers. Numbers are documented facts (qualified by version/config) or arithmetic labelled illustrative. Author experience claims come only from the writer brief/resume.
 - Every claim traces to the claims ledger. Code/config not validated against a specific version is labelled illustrative.
@@ -111,6 +112,7 @@ A fresh Opus agent that did not write the article. It reads `plan.md`, the MDX, 
 - **Check consistency between diagrams and text**: FlowDiagram/SequenceDiagram steps, lab behaviour and the prose describe the same flow, names and order.
 - **Review code examples and edge cases**: config keys and syntax are plausible for the stated version; calc functions handle zero, max, invalid and boundary inputs; units are consistent.
 - **Identify unsupported performance claims**: any number without a claims-ledger source or an "illustrative" label.
+- **Check for obvious content**: flag definitions of things an engineer already knows as `should-fix` (delete, or move to a `<Details>` box if it is genuinely non-obvious background).
 - **Check voice**: flag third-person/impersonal narration ("This article", "the author", "we", "let's") as `should-fix`, and any invented first-person anecdote as `must-fix`.
 
 Each finding: location (`file:line`), the problem, why it is wrong, and the fix, tagged `must-fix` or `should-fix`. Facts it cannot verify are listed as such, not guessed.
