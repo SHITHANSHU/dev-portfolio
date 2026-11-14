@@ -1,8 +1,44 @@
 "use client";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ThemeToggle } from "./ThemeToggle";
+
+/** Below this scroll offset the header always shows. */
+const SHOW_NEAR_TOP_PX = 80;
+/** Mouse within this distance of the viewport top reveals the header. */
+const REVEAL_ZONE_PX = 72;
+
+/**
+ * Hide the header once the reader scrolls down; bring it back when the mouse moves to the top edge.
+ * Touch screens have no mouse, so there it returns on scroll up. Keyboard focus reveals it via CSS.
+ */
+function useAutoHide(): boolean {
+  const [hidden, setHidden] = useState(false);
+  useEffect(() => {
+    const touch = window.matchMedia?.("(hover: none)").matches ?? false;
+    let lastY = window.scrollY;
+    let mouseNearTop = false;
+    const update = (scrollingUp = false) => {
+      const y = window.scrollY;
+      if (y < SHOW_NEAR_TOP_PX || mouseNearTop) setHidden(false);
+      else setHidden(touch ? !scrollingUp : true);
+    };
+    const onScroll = () => {
+      const y = window.scrollY;
+      update(y < lastY);
+      lastY = y;
+    };
+    const onMouseMove = (e: MouseEvent) => {
+      const near = e.clientY <= REVEAL_ZONE_PX;
+      if (near !== mouseNearTop) { mouseNearTop = near; update(); }
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("mousemove", onMouseMove, { passive: true });
+    return () => { window.removeEventListener("scroll", onScroll); window.removeEventListener("mousemove", onMouseMove); };
+  }, []);
+  return hidden;
+}
 
 const nav = [
   { href: "/journal/", label: "Journal" },
@@ -14,9 +50,13 @@ const nav = [
 export function Header() {
   const path = usePathname();
   const [open, setOpen] = useState(false);
+  const hidden = useAutoHide() && !open;
   const active = (href: string) => path.startsWith(href);
   return (
-    <header className="sticky top-0 z-40 border-b border-rule bg-paper/95 backdrop-blur-none no-print">
+    <header
+      data-hidden={hidden || undefined}
+      className={`sticky top-0 z-40 border-b border-rule bg-paper/95 backdrop-blur-none no-print transition-transform duration-200 ${hidden ? "-translate-y-full" : ""} focus-within:translate-y-0`}
+    >
       <div className="wrap flex h-14 items-center justify-between">
         <Link href="/" className="flex items-baseline gap-2" onClick={() => setOpen(false)}>
           <span className="font-serif text-lg font-semibold tracking-tight">S. Mishra</span>
