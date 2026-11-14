@@ -21,11 +21,11 @@ So the system ends up with two stores: MySQL as the system of record, Elasticsea
 - **Bounded staleness.** The delay between commit and searchability is measurable and has an alert on it.
 - **Recoverability.** When something breaks (and it will), there is a defined path back to a provably consistent index.
 
-The title promises a pipeline that "scales to 1,000 RPS". That phrase needs care before anything else, because 1,000 requests per second is a property of the application's front door, not of the replication pipeline. We derive the real CDC event rate from first principles in the capacity section, and the calculator in that section lets you vary every assumption. This article does not present benchmark results; every number below is either a documented protocol or product fact (qualified by version where it matters) or explicitly labelled illustrative arithmetic.
+The title promises a pipeline that "scales to 1,000 RPS". That phrase needs care before anything else, because 1,000 requests per second is a property of the application's front door, not of the replication pipeline. I derive the real CDC event rate from first principles in the capacity section, and the calculator in that section lets you vary every assumption. I present no benchmark results here; every number below is either a documented protocol or product fact (qualified by version where it matters) or explicitly labelled illustrative arithmetic.
 
 <Callout type="assumption" title="Scope and assumptions">
 
-The design assumes MySQL 8.x (or a compatible MySQL 5.7 setup) with row-based binary logging, a Kafka cluster operated by the team, Kafka Connect for the Debezium source, and Elasticsearch 7.x or 8.x. Configuration snippets are illustrative and not validated against a specific version; property names differ between Debezium 1.x and 2.x and we call out the ones we know changed. The author has worked with this class of pipeline; no production figures from any employer or customer appear here.
+The design assumes MySQL 8.x (or a compatible MySQL 5.7 setup) with row-based binary logging, a Kafka cluster operated by the team, Kafka Connect for the Debezium source, and Elasticsearch 7.x or 8.x. Configuration snippets are illustrative and not validated against a specific version; property names differ between Debezium 1.x and 2.x and I call out the ones I know changed. I have worked with this class of pipeline; I include no production figures from any employer or customer.
 
 </Callout>
 
@@ -133,7 +133,7 @@ When a connector starts for the first time (snapshot mode `initial` by default),
 3. Scan each table and emit one read event (`op: "r"`) per row.
 4. Switch to streaming from the position recorded in step 1.
 
-The snapshot is the heaviest thing the connector ever does: it scans full tables on the primary or a replica. Debezium also supports incremental snapshots (available since the 1.6 line), triggered through a signalling table, which interleave chunked reads of a table with the live stream using watermarks. Incremental snapshots are the preferred tool for backfilling a single table or re-syncing an index later without stopping capture, and we use them in the recovery section.
+The snapshot is the heaviest thing the connector ever does: it scans full tables on the primary or a replica. Debezium also supports incremental snapshots (available since the 1.6 line), triggered through a signalling table, which interleave chunked reads of a table with the live stream using watermarks. Incremental snapshots are the preferred tool for backfilling a single table or re-syncing an index later without stopping capture, and I use them in the recovery section.
 
 Other snapshot modes exist (for example schema-only, when-needed, and never; names and availability differ across Debezium versions). Schema-only is useful when the downstream is already populated and only changes matter. Verify the exact mode names against your Debezium version.
 
@@ -161,7 +161,7 @@ A row change becomes a Kafka record whose key is the primary key of the row (as 
 }
 ```
 
-The operation codes are `c` (create), `u` (update), `d` (delete), `r` (snapshot read). The `source` block locates the change in the log, which will matter when we choose a document version. Note the two timestamps: `source.ts_ms` is when the change was recorded in the database; the outer `ts_ms` is when the connector processed it. Their difference is a free measure of capture latency.
+The operation codes are `c` (create), `u` (update), `d` (delete), `r` (snapshot read). The `source` block locates the change in the log, which will matter when I choose a document version. Note the two timestamps: `source.ts_ms` is when the change was recorded in the database; the outer `ts_ms` is when the connector processed it. Their difference is a free measure of capture latency.
 
 Topics are named by prefix, database and table (for example `shop.shop.orders` under the Debezium 2.x `topic.prefix` property; Debezium 1.x used `database.server.name`). One topic per table is the default and the right starting point: it keeps schemas homogeneous and lets consumers scale and fail per table.
 
@@ -394,7 +394,7 @@ and the indexing demand is `CDC events/sec x index operations per event`. Illust
 | Typical mixed service | 1,000 | 20% | 3 | 600 | 1 | 600 |
 | Write-heavy with fan-out | 1,000 | 60% | 4 | 2,400 | 2 | 4,800 |
 
-The same 1,000 RPS spans nearly two orders of magnitude of indexing demand. "Scales to 1,000 RPS" is therefore meaningless without stating the ratios. The defensible phrasing is a statement about events per second at a stated event size, validated by a benchmark you ran on your hardware. We have not run one for this article and do not claim a capacity result.
+The same 1,000 RPS spans nearly two orders of magnitude of indexing demand. "Scales to 1,000 RPS" is therefore meaningless without stating the ratios. The defensible phrasing is a statement about events per second at a stated event size, validated by a benchmark you ran on your hardware. I have not run one for this article and do not claim a capacity result.
 
 ### Bandwidth and sizing arithmetic
 
@@ -532,11 +532,11 @@ Some decisions have no universally right answer.
 
 Stated plainly, so the reader can discount accordingly:
 
-- No benchmark was run for this article. Capacity numbers are arithmetic on stated assumptions, not measurements, and real throughput depends on mappings, shard layout, hardware, query load, network, and software versions.
+- I ran no benchmark for this article. Capacity numbers are arithmetic on stated assumptions, not measurements, and real throughput depends on mappings, shard layout, hardware, query load, network, and software versions.
 - The design assumes a single MySQL primary with row-based binary logging and a modest number of captured tables. Very large tables, extreme write rates, multi-primary topologies and sharded MySQL fleets raise different problems (single-threaded capture limits, snapshot duration, cross-shard ordering) that are not addressed here.
-- Config property names and defaults reflect the author's understanding of Debezium 1.x and 2.x, Kafka 3.x and Elasticsearch 7.x and 8.x and may differ in your versions. Snippets are illustrative.
+- Config property names and defaults reflect my understanding of Debezium 1.x and 2.x, Kafka 3.x and Elasticsearch 7.x and 8.x and may differ in your versions. Snippets are illustrative.
 - External versioning schemes derived from timestamps assume source clocks and the binlog order agree closely enough; test them against failover.
-- Exactly-once is not claimed anywhere end to end; the design provides effectively-once outcomes through idempotent writes.
+- I do not claim exactly-once end to end anywhere; the design provides effectively-once outcomes through idempotent writes.
 - The interactive labs are simplified models for building intuition. They are not predictions of any real system's performance.
 
 ## Conclusion

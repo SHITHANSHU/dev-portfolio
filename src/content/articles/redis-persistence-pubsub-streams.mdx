@@ -18,11 +18,11 @@ The trouble starts when the same server is asked to hold work. A job queue, a no
 
 Redis answers each of those questions differently depending on which feature you chose and how it is configured. Persistence, replication, Pub/Sub, lists and Streams are separate mechanisms with separate guarantees, and a design that mixes them up (for example, "we use Pub/Sub, and AOF is on, so messages are durable") is wrong in a way that only shows up during an incident.
 
-The author has used Redis in production for caching and rate limiting in multi-tenant platforms, and has worked on a workflow engine built around queue-based durable processing with back-pressure and rate limiting. This article is a design discussion drawn from that class of system and from the Redis documentation, not a report on one deployment, and it contains no measurements. Every number is either a documented default or product fact (qualified by version) or arithmetic explicitly labelled illustrative. Configuration and code are illustrative and not validated against a specific build unless stated.
+I have used Redis in production for caching and rate limiting in multi-tenant platforms, and have worked on a workflow engine built around queue-based durable processing with back-pressure and rate limiting. This article is a design discussion I drew from that class of system and from the Redis documentation, not a report on one deployment, and it contains no measurements. Every number is either a documented default or product fact (qualified by version) or arithmetic explicitly labelled illustrative. Configuration and code are illustrative and not validated against a specific build unless stated.
 
 <Callout type="assumption" title="Version scope">
 
-Behavior is described for open-source Redis 7.x (7.0 and 7.2 in particular) and called out where Redis 6.x or earlier differs. Where a feature arrived in a specific release, the release is named. Forks and managed services may differ in defaults and in which commands are permitted, so check the documentation of what you actually run.
+I describe behavior for open-source Redis 7.x (7.0 and 7.2 in particular) and call out where Redis 6.x or earlier differs. Where a feature arrived in a specific release, I name the release. Forks and managed services may differ in defaults and in which commands are permitted, so check the documentation of what you actually run.
 
 </Callout>
 
@@ -34,7 +34,7 @@ First, every command is atomic with respect to every other command. There is no 
 
 Second, any slow command is a stall for every client. `KEYS *` on a large keyspace, `SMEMBERS` on a set with millions of members, a Lua script with a loop, deleting a huge key with `DEL` instead of `UNLINK`, and, most relevant to this article, any persistence work done on the main thread. The latency budget of the whole server is shared. A design that adds durability has to be judged by how much of that work lands on the one thread.
 
-There is also a structural consequence for scaling: one Redis process uses essentially one core for commands, so scaling writes means more processes (Cluster), not more threads. A single stream or list lives on one node in one process, which matters when we compare Streams with Kafka partitions later.
+There is also a structural consequence for scaling: one Redis process uses essentially one core for commands, so scaling writes means more processes (Cluster), not more threads. A single stream or list lives on one node in one process, which matters when I compare Streams with Kafka partitions later.
 
 ## Data structures as messaging building blocks
 
@@ -50,7 +50,7 @@ Redis is a data structure server, and its messaging features are thin layers ove
 | Stream (5.0) | Append-only log with consumer groups | IDs, replay by ID, per-group pending entries, explicit acknowledgement |
 | Pub/Sub | Fan-out to connected subscribers | No storage at all; not a data structure |
 
-Pub/Sub is the odd one out: it stores nothing, which is the whole story of its guarantees. The other messaging options inherit whatever durability and replication properties the keyspace has, which is why we start with persistence.
+Pub/Sub is the odd one out: it stores nothing, which is the whole story of its guarantees. The other messaging options inherit whatever durability and replication properties the keyspace has, which is why I start with persistence.
 
 ## Persistence: what reaches disk and when
 
@@ -337,7 +337,7 @@ while True:
         drain(entries)
 ```
 
-The sketch omits retries bounded by delivery count, clean shutdown, reconnect backoff and a timer for the claim step.
+I omit from the sketch retries bounded by delivery count, clean shutdown, reconnect backoff and a timer for the claim step.
 
 ### Trimming: XTRIM, MAXLEN, MINID and the tilde
 
@@ -359,7 +359,7 @@ A stream is an ordinary value as far as RDB, AOF and replication are concerned. 
 
 ## Choosing between Pub/Sub, lists, Streams and Kafka
 
-The table summarizes semantics rather than throughput; no performance comparison is claimed or implied.
+The table summarizes semantics rather than throughput; I claim or imply no performance comparison.
 
 | Property | Pub/Sub | List (LMOVE pattern) | Stream with consumer groups | Kafka |
 | --- | --- | --- | --- | --- |
@@ -374,7 +374,7 @@ The table summarizes semantics rather than throughput; no performance comparison
 | Capacity bound | Memory of output buffers | RAM | RAM (plus fork and replication cost) | Disk and retention |
 | Operational ecosystem | Minimal | Minimal | Minimal, plus your reaper | Connectors, schema registry, stream processing |
 
-Redis Streams are the right tool when the flow is moderate, the data is already in Redis, you want sub-millisecond-class round trips and a few commands rather than a platform, the retention is short, and a team can accept the operational semantics above (at-least-once, manual dead-lettering, failover loss unless `WAIT`). Examples: a work queue between services of one product, a back-pressure buffer for rate-limited downstream calls, a short-window event feed to a dashboard. This is the territory of the workflow-engine style of queue-based durable processing that the author has worked with.
+Redis Streams are the right tool when the flow is moderate, the data is already in Redis, you want sub-millisecond-class round trips and a few commands rather than a platform, the retention is short, and a team can accept the operational semantics above (at-least-once, manual dead-lettering, failover loss unless `WAIT`). Examples: a work queue between services of one product, a back-pressure buffer for rate-limited downstream calls, a short-window event feed to a dashboard. This is the territory of the workflow-engine style of queue-based durable processing that I have worked with.
 
 Kafka is the right tool when the log is the system of record or integration backbone: retention of days or more, many consumers replaying from arbitrary offsets, partitioned parallelism with per-key ordering, stream processing and connectors. The sibling articles on MQTT to Kafka to MongoDB telemetry and CDC from MySQL to Elasticsearch are cases where the log must outlive consumers. The decision turns on retention and fan-out, not speed.
 
@@ -438,7 +438,7 @@ ACL SETUSER default off
 
 ## Failure scenarios walk-through
 
-Each scenario below states the setup, what Redis does, what the client sees, and the mitigation.
+For each scenario below I state the setup, what Redis does, what the client sees, and the mitigation.
 
 **1. Master process killed, AOF `everysec`, no replica.** The restart replays the AOF. The writes since the last fsync (typically about a second) are missing if the host also failed; if only the process died, the page cache survives and little or nothing is lost. A producer that was told "OK" for a lost write is not told otherwise. Mitigation: `always` or `WAITAOF` for important writes, and producers that can re-send with idempotency.
 
@@ -458,9 +458,9 @@ Each scenario below states the setup, what Redis does, what the client sees, and
 
 ## Assumptions and limitations
 
-<Callout type="assumption" title="What this article does not claim">
+<Callout type="assumption" title="What I do not claim">
 
-No benchmark or throughput figure is given or implied; Redis performance depends on command mix, payload size, hardware, pipelining, persistence settings and client behavior, and must be measured for a given workload. Defaults and behaviors are stated for open-source Redis 7.x with differences noted, and may differ in forks and managed offerings, in versions after 7.2, and in specific minor releases. Code is a sketch: error handling, shutdown, retry limits and observability are reduced to keep it readable. The labs are simplified models of the semantics, not emulators. Sentinel and Cluster failover details are summarized and omit election timing, configuration epochs and edge cases that matter in a real incident review.
+I give or imply no benchmark or throughput figure; Redis performance depends on command mix, payload size, hardware, pipelining, persistence settings and client behavior, and must be measured for a given workload. I state defaults and behaviors for open-source Redis 7.x with differences noted, and they may differ in forks and managed offerings, in versions after 7.2, and in specific minor releases. Code is a sketch: I reduce error handling, shutdown, retry limits and observability to keep it readable. The labs are simplified models of the semantics, not emulators. I summarize Sentinel and Cluster failover details and omit election timing, configuration epochs and edge cases that matter in a real incident review.
 
 </Callout>
 

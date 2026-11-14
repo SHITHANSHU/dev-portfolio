@@ -14,9 +14,9 @@ related: ["cdc-mysql-debezium-kafka-elasticsearch", "iot-mqtt-kafka-ksqldb-mongo
 
 An IP camera is a small embedded computer with a lens attached. It captures light, processes it into an image, compresses that image with a hardware encoder, and serves the result over the network. Everything downstream, from recorder disks to GPU decoders to the accuracy of a licence plate reader, is a consequence of a handful of settings on that device: resolution, frame rate, codec, bitrate mode, keyframe interval and which stream profile you pull.
 
-Those settings are usually chosen by whoever mounts the camera, using the vendor web UI, with a view to how the live picture looks. The people who pay for the choice are different: the platform team sizing storage and network, and the analytics team wondering why plate recognition fails at night. This article follows the stream from sensor to inference so that those trade-offs can be reasoned about, not guessed.
+Those settings are usually chosen by whoever mounts the camera, using the vendor web UI, with a view to how the live picture looks. The people who pay for the choice are different: the platform team sizing storage and network, and the analytics team wondering why plate recognition fails at night. I follow the stream from sensor to inference so that you can reason about those trade-offs, not guess them.
 
-The author has worked with this class of system, including backend architecture for a video management system (VMS) targeting 100k+ IP cameras. This article does not report measurements from that work. Every number here is either a standard protocol fact, qualified by version or configuration where it varies, or clearly labelled illustrative arithmetic. Nothing was benchmarked for this piece.
+I have worked with this class of system, including backend architecture for a video management system (VMS) targeting 100k+ IP cameras. I do not report measurements from that work. Every number here is either a standard protocol fact, qualified by version or configuration where it varies, or clearly labelled illustrative arithmetic. I benchmarked nothing for this piece.
 
 Five interactive labs are embedded at the points where a slider is more convincing than a paragraph. The text stands on its own without them.
 
@@ -193,7 +193,7 @@ Claiming a profile does not guarantee identical behavior; conformance testing co
 - ONVIF `SetVideoEncoderConfiguration` can change camera settings remotely, which is useful for fleet management and dangerous if unreviewed; treat it as a write path.
 - Do not assume every ONVIF field is implemented. Read capabilities, test, and keep a per-model quirks table.
 
-The `onvif-camera` workflow the author uses for probing devices (discover, list profiles, resolve URLs, check Profile G recording) relies on exactly these calls.
+The `onvif-camera` workflow I use for probing devices (discover, list profiles, resolve URLs, check Profile G recording) relies on exactly these calls.
 
 ## Main stream, substream and which one to feed to inference
 
@@ -370,7 +370,7 @@ An **NVR** (network video recorder) is typically an appliance: it connects to a 
 
 **Playback and live APIs.** Browsers cannot play RTSP directly. The usual approaches are to repackage into HLS or low-latency HLS (seconds of latency), or WebRTC (sub-second, more moving parts), or to run a native client. Live view for a grid should use substreams.
 
-**Scaling to very large camera counts.** The author has worked on VMS architecture for fleets on the order of 100k+ cameras; the principles, not any measured figures, are what carry over:
+**Scaling to very large camera counts.** I have worked on VMS architecture for fleets on the order of 100k+ cameras; the principles, not any measured figures, are what carry over:
 
 - Partition by camera: assign each camera to a recorder and gateway shard through a registry, so no component needs to know about all cameras.
 - Make assignment dynamic with leases so a failed node's cameras are re-homed automatically; a camera reconnect storm needs jitter and backoff, or recovery itself causes an outage.
@@ -436,9 +436,9 @@ Cameras are network-attached embedded devices that often run old firmware and ha
 - Camera behavior is firmware-dependent. Statements about B-frames, smart codecs, keyframe signalling, session limits and ONVIF coverage describe common cases, not every device.
 - The labs use simplified models with assumed efficiency factors and illustrative frame-size ratios. They show direction of effect, not measured outcomes, and should not be used as procurement numbers.
 - Efficiency figures for H.265 and thresholds such as pixels across a plate are commonly cited ranges and rules of thumb; validate on your own cameras, scenes and models.
-- Code and configuration snippets are illustrative and were not validated against a specific FFmpeg, OpenCV, GStreamer or camera firmware version. Option names in particular change between releases.
-- The article covers RTSP-based pull ingestion. Push-based paths such as RTMP or SRT, WebRTC ingestion, cloud-managed cameras and onboard-recording retrieval via ONVIF Profile G are outside this scope.
-- No performance or capacity measurements from the author's own systems are reported here.
+- Code and configuration snippets are illustrative, and I did not validate them against a specific FFmpeg, OpenCV, GStreamer or camera firmware version. Option names in particular change between releases.
+- I cover RTSP-based pull ingestion. Push-based paths such as RTMP or SRT, WebRTC ingestion, cloud-managed cameras and onboard-recording retrieval via ONVIF Profile G are outside my scope here.
+- I report no performance or capacity measurements from my own systems here.
 
 ## Conclusion
 

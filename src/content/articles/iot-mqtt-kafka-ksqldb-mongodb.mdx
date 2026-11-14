@@ -17,18 +17,18 @@ A device fleet is a distributed system whose nodes have intermittent power, cell
 - What is the state of device X right now? (a point lookup, latency measured in milliseconds)
 - What did fleet segment Y look like over the last week, and is it anomalous? (a range scan or aggregation over many devices)
 
-No single component serves both well, and no single component fits the transport requirements of the edge either. The architecture in this article splits the problem along those seams:
+No single component serves both well, and no single component fits the transport requirements of the edge either. The architecture I describe here splits the problem along those seams:
 
 - **MQTT** handles the device-facing edge: small constrained clients, flaky links, session state, and a publish/subscribe topic model.
 - **Kafka** is the durable, replayable, partitioned log that decouples ingestion from every consumer.
 - **ksqlDB** runs continuous queries over the log: filtering, enrichment, windowed aggregation.
 - **MongoDB** serves queries: a latest-state collection for point lookups and a time-series collection for history.
 
-The author has worked with this class of pipeline (Kafka, MQTT and ksqlDB for traffic analytics, MongoDB for storage). Everything below is written as a design discussion, not as a report of one deployment. Every number is either a protocol or product fact stated with its version dependency, or arithmetic labelled illustrative. Code is illustrative and not validated against a specific version unless stated otherwise.
+I have worked with this class of pipeline (Kafka, MQTT and ksqlDB for traffic analytics, MongoDB for storage). I write everything below as a design discussion, not as a report of one deployment. Every number is either a protocol or product fact stated with its version dependency, or arithmetic labelled illustrative. Code is illustrative and not validated against a specific version unless stated otherwise.
 
 <Callout type="assumption" title="Scope and assumptions">
 
-The reference design assumes: devices speak MQTT over TLS to a clustered broker; one Kafka cluster with replication factor 3; ksqlDB in a small cluster reading Kafka topics; MongoDB 6.0 or newer (time-series collections exist from 5.0, but several features discussed here arrived later and are called out). Fleet sizes used below (10,000 to 100,000 devices) are arithmetic conveniences, not measurements.
+My reference design assumes: devices speak MQTT over TLS to a clustered broker; one Kafka cluster with replication factor 3; ksqlDB in a small cluster reading Kafka topics; MongoDB 6.0 or newer (time-series collections exist from 5.0, but several features discussed here arrived later and are called out). Fleet sizes used below (10,000 to 100,000 devices) are arithmetic conveniences, not measurements.
 
 </Callout>
 
@@ -38,7 +38,7 @@ The reference design assumes: devices speak MQTT over TLS to a clustered broker;
 <FlowDiagram title="Telemetry path" steps={[{label:"Devices",sub:"sensors, gateways"},{label:"MQTT broker",sub:"sessions, topics, ACLs",tone:"store"},{label:"Bridge",sub:"MQTT to Kafka"},{label:"Kafka",sub:"raw topic, partitioned",tone:"store"},{label:"ksqlDB",sub:"clean, window, aggregate"},{label:"Kafka",sub:"derived topics",tone:"store"},{label:"Sink",sub:"Kafka Connect or consumer"},{label:"MongoDB",sub:"state + time series",tone:"store"}]} />
 </Figure>
 
-The responsibilities, stated so that each is owned once:
+I state the responsibilities so that each is owned once:
 
 | Component | Owns | Explicitly does not own |
 | --- | --- | --- |
@@ -56,7 +56,7 @@ Devices fall into three practical categories, which change the design:
 
 1. **Direct MQTT devices** (microcontrollers, modems) with a few KB of RAM and a TLS stack. They hold one long-lived TCP connection and reconnect after drops.
 2. **Gateways** that aggregate local sensors (BLE, Modbus, serial) and speak MQTT upstream. They multiplex many logical devices over one connection, so `clientId` identifies the gateway, not the sensor.
-3. **HTTP-only or batch devices**, which need a separate ingestion path. This article does not cover them.
+3. **HTTP-only or batch devices**, which need a separate ingestion path. I do not cover them here.
 
 Three properties of the edge shape everything downstream:
 
@@ -94,7 +94,7 @@ Here is the whole pipeline running end to end with synthetic devices. Use the co
 
 <IotPipelineSimulator />
 
-Watch the per-stage counters rather than the animation. When you raise the publish rate, the stage whose counter diverges first from the one upstream of it is the bottleneck, and the gap between them is the in-flight backlog. That is exactly the quantity to alert on in a real deployment. The simulation is synthetic and illustrates flow and backpressure shape; it makes no claim about the throughput of any real broker or cluster.
+Watch the per-stage counters rather than the animation. When you raise the publish rate, the stage whose counter diverges first from the one upstream of it is the bottleneck, and the gap between them is the in-flight backlog. That is exactly the quantity to alert on in a real deployment. The simulation is synthetic and illustrates flow and backpressure shape; I make no claim here about the throughput of any real broker or cluster.
 
 ## MQTT QoS 0, 1 and 2: what is and is not guaranteed
 
@@ -131,7 +131,7 @@ The interactive below lets you choose a QoS level and inject faults: drop the PU
 
 <MqttQosPlayground />
 
-You should see that QoS 1 produces a duplicate delivery in the dropped-acknowledgement case and QoS 0 silently produces nothing, and that QoS 2 suppresses the duplicate at the receiver. Then notice that the playground's application-level idempotency toggle is what makes the final stored result correct in every case. The protocol guarantee and the application guarantee are different layers, and the playground deliberately simplifies timers and broker internals.
+You should see that QoS 1 produces a duplicate delivery in the dropped-acknowledgement case and QoS 0 silently produces nothing, and that QoS 2 suppresses the duplicate at the receiver. Then notice that the playground's application-level idempotency toggle is what makes the final stored result correct in every case. The protocol guarantee and the application guarantee are different layers, and I deliberately simplify timers and broker internals in the playground.
 
 ## MQTT 3.1.1 versus MQTT 5 in this pipeline
 
@@ -255,13 +255,13 @@ Try different key strategies against a synthetic fleet. Set the device count, pa
 
 <IotPartitioningExplorer />
 
-With device ID keys on a uniform fleet the bars should be roughly even, and each device's messages stay in one partition. Switch to a site-level key or add a heavy-hitter class and one bar grows: that is a hot partition. Switch to no key and the distribution evens out but per-device ordering disappears. The explorer uses a simple deterministic hash rather than Kafka's exact murmur2 mapping, so it demonstrates distribution shape, not the actual partition assigned to a real key.
+With device ID keys on a uniform fleet the bars should be roughly even, and each device's messages stay in one partition. Switch to a site-level key or add a heavy-hitter class and one bar grows: that is a hot partition. Switch to no key and the distribution evens out but per-device ordering disappears. I use a simple deterministic hash in the explorer rather than Kafka's exact murmur2 mapping, so it demonstrates distribution shape, not the actual partition assigned to a real key.
 
 Partition placement determines which consumer can read a record, but consumer progress is tracked separately for every partition. The Kafka playground below animates the next offset versus the committed offset. Increase the producer rate above processing capacity to grow lag; switch to manual commits, process records, then simulate a crash to see why records after the last commit can be delivered again.
 
 <KafkaConsumerGroupPlayground />
 
-The model treats offsets as the next record to read and reports lag against the committed offset. Real Kafka consumers can commit automatically or manually, and assignment and rebalance behavior depends on the consumer protocol and assignor. This simulation intentionally focuses on the processing-to-commit gap, not broker timing.
+The model treats offsets as the next record to read and reports lag against the committed offset. Real Kafka consumers can commit automatically or manually, and assignment and rebalance behavior depends on the consumer protocol and assignor. I intentionally focus this simulation on the processing-to-commit gap, not broker timing.
 
 ### Retention and compaction
 
@@ -409,7 +409,7 @@ Use the explorer below to change the window type, size and grace period and to c
 
 <StreamWindowExplorer />
 
-Compare the same arrival pattern with grace period zero versus a few minutes: the aggregate for early windows changes after the fact, and late events beyond grace are listed as dropped. Switch to session windows and watch two sessions merge when a late event lands in the gap between them. The explorer makes explicit simplifications: a single partition, one stream-time clock, no repartitioning, no suppression buffer limits, and no changelog or state-store behavior.
+Compare the same arrival pattern with grace period zero versus a few minutes: the aggregate for early windows changes after the fact, and late events beyond grace are listed as dropped. Switch to session windows and watch two sessions merge when a late event lands in the gap between them. I make explicit simplifications in the explorer: a single partition, one stream-time clock, no repartitioning, no suppression buffer limits, and no changelog or state-store behavior.
 
 ## Delivery guarantees across the whole path, and idempotent design
 
@@ -545,7 +545,7 @@ Browse representative synthetic documents, toggle index choices, and run the sam
 
 <MongoDataExplorer />
 
-You should see that the per-device range query with a compound index examines only the matching entries while the same query without it scans broadly, and that expiry settings change the estimated footprint linearly with the retention period. The explorer works on synthetic documents and illustrative cost estimates; it does not run a MongoDB server, and its figures are not benchmarks.
+You should see that the per-device range query with a compound index examines only the matching entries while the same query without it scans broadly, and that expiry settings change the estimated footprint linearly with the retention period. I built the explorer on synthetic documents and illustrative cost estimates; it does not run a MongoDB server, and its figures are not benchmarks.
 
 ### Retention, indexing and storage cost
 
@@ -614,13 +614,13 @@ Scaling paths, in rough order of increasing cost: add bridge instances behind a 
 
 ## Assumptions and limitations
 
-- Design numbers (fleet sizes, rates, payload sizes, retention periods, storage estimates) are illustrative arithmetic and not measurements of any system. Real throughput depends on hardware, message size, partitioning, serialization, and configuration; benchmark with your own data.
-- Version-dependent facts (MQTT broker features, ksqlDB window options and emission modes, Kafka defaults, MongoDB time-series capabilities) are stated with the versions where known; verify against the versions you deploy, as these features have changed across releases.
-- Configuration and code snippets are plausible and illustrative, not validated against a specific version, and are not production hardening guides.
-- Broker-specific behavior (session replication on failover, shared-subscription distribution, queue overflow) varies by implementation and is not described here for any one product.
-- The interactive labs are synthetic simulations with deliberate simplifications (a simple hash instead of murmur2, one partition and one stream clock in the window explorer, no real MongoDB engine). They illustrate mechanisms, not performance.
-- The design assumes at-least-once ingestion with idempotent consumers. Systems that must have strict exactly-once semantics end to end need additional design (transactional outbox patterns, deduplication stores, or a sink with transactional support), which is beyond this article.
-- Not covered: device firmware and OTA updates, edge buffering design, HTTP and CoAP ingestion, long-term analytics engines, and multi-region topologies.
+- My design numbers (fleet sizes, rates, payload sizes, retention periods, storage estimates) are illustrative arithmetic and not measurements of any system. Real throughput depends on hardware, message size, partitioning, serialization, and configuration; benchmark with your own data.
+- I state version-dependent facts (MQTT broker features, ksqlDB window options and emission modes, Kafka defaults, MongoDB time-series capabilities) with the versions where known; verify against the versions you deploy, as these features have changed across releases.
+- My configuration and code snippets are plausible and illustrative, not validated against a specific version, and are not production hardening guides.
+- Broker-specific behavior (session replication on failover, shared-subscription distribution, queue overflow) varies by implementation and I do not describe it here for any one product.
+- My interactive labs are synthetic simulations with deliberate simplifications (a simple hash instead of murmur2, one partition and one stream clock in the window explorer, no real MongoDB engine). They illustrate mechanisms, not performance.
+- I assume at-least-once ingestion with idempotent consumers. Systems that must have strict exactly-once semantics end to end need additional design (transactional outbox patterns, deduplication stores, or a sink with transactional support), which is beyond what I cover here.
+- I do not cover: device firmware and OTA updates, edge buffering design, HTTP and CoAP ingestion, long-term analytics engines, and multi-region topologies.
 
 ## Conclusion
 

@@ -16,7 +16,7 @@ RabbitMQ is often introduced as a queue: a producer sends a message, a worker re
 
 In AMQP 0-9-1, publishers send to exchanges. Exchanges route to queues (or other exchanges) through bindings. Queues hold messages until consumers receive and acknowledge them. Priority, persistence, expiry and dead lettering each alter a different part of that path. Combining them without naming those boundaries leads to familiar failures: a message is published but unroutable, acknowledged by the broker but not safe across a restart, or delayed behind an unrelated message whose TTL has not elapsed.
 
-This article uses RabbitMQ 4.4 as the reference point for version-sensitive behavior. Most exchange, TTL and dead-letter examples apply to RabbitMQ 3.x and 4.x; quorum-queue priority and native delayed delivery differ by release. Examples use AMQP 0-9-1 concepts, with Java-like pseudocode where client APIs vary. No throughput claims are made.
+I use RabbitMQ 4.4 as the reference point for version-sensitive behavior. Most exchange, TTL and dead-letter examples apply to RabbitMQ 3.x and 4.x; quorum-queue priority and native delayed delivery differ by release. My examples use AMQP 0-9-1 concepts, with Java-like pseudocode where client APIs vary. I make no throughput claims here.
 
 ## A message’s route through the broker
 
@@ -183,6 +183,6 @@ RabbitMQ gives useful routing and work-queue primitives, but the guarantees stop
 
 <Callout type="assumption" title="Scope">
 
-The article describes AMQP 0-9-1 with RabbitMQ 4.4 as the current reference. Strict 32-level quorum priorities arrived in 4.3, and native quorum-queue delayed delivery arrived in 4.4. Classic queue priority configuration and TTL/DLX behavior are documented separately because queue type and release affect details. Configuration snippets are illustrative; validate topology, policy support, client property types and dead-letter strategy against the exact RabbitMQ release and managed service. No benchmark or delivery-time guarantee is implied.
+I describe AMQP 0-9-1 with RabbitMQ 4.4 as the current reference. Strict 32-level quorum priorities arrived in 4.3, and native quorum-queue delayed delivery arrived in 4.4. I cover classic queue priority configuration and TTL/DLX behavior separately because queue type and release affect details. My configuration snippets are illustrative; validate topology, policy support, client property types and dead-letter strategy against the exact RabbitMQ release and managed service. I imply no benchmark or delivery-time guarantee.
 
 </Callout>
