@@ -1,0 +1,177 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 780" width="1100" height="780" role="img" aria-labelledby="t d">
+<title id="t">PicoPal circuit by net label</title><desc id="d">ESP32-C3 SuperMini in the centre. I2C SDA GPIO6 and SCL GPIO7 go to the OLED and VL53L0X; TTP223 output to GPIO4; VL53L0X XSHUT to GPIO3; MAX98357A BCLK GPIO5, LRC GPIO10, DIN GPIO21, SD tied to 3V3, VIN 5V; pan servo signal GPIO20, tilt servo signal GPIO1, both powered from an external 5 V 2 A supply with common ground.</desc>
+<rect width="1100" height="780" fill="#fbf9f4"/>
+<g font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" fill="#1b1a17">
+<text x="30" y="40" font-size="20" text-anchor="start" font-weight="600" fill="#1b1a17">PicoPal — circuit by net label</text>
+<text x="30" y="62" font-size="12" text-anchor="start" font-weight="400" fill="#6a665b">Same net name = same wire. Illustration drawn from the project's pin header; check the silkscreen on your SuperMini clone.</text>
+<rect x="450" y="150" width="200" height="360" fill="#f1ede2" stroke="#1b1a17" stroke-width="2.2"/>
+<rect x="520" y="136" width="60" height="18" fill="#d9d4c6" stroke="#1b1a17" stroke-width="1.4"/>
+<text x="550" y="149" font-size="10" text-anchor="middle" font-weight="600" fill="#1b1a17">USB-C</text>
+<text x="550" y="180" font-size="14" text-anchor="middle" font-weight="700" fill="#1b1a17">ESP32-C3 SuperMini</text>
+<text x="550" y="197" font-size="11" text-anchor="middle" font-weight="400" fill="#6a665b">4 MB flash · 3.3 V logic</text>
+<text x="460" y="234" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GPIO5</text>
+<line x1="420" y1="230" x2="450" y2="230" stroke="#1d5b57" stroke-width="2"/>
+<polygon points="420,230 412,220 368,220 368,240 412,240" fill="#ffffff" stroke="#1d5b57" stroke-width="1.6"/><text x="390.0" y="234" font-size="11" text-anchor="middle" font-weight="600" fill="#1d5b57" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">BCLK</text>
+<text x="460" y="266" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GPIO6</text>
+<line x1="420" y1="262" x2="450" y2="262" stroke="#2d5aa0" stroke-width="2"/>
+<polygon points="420,262 412,252 377,252 377,272 412,272" fill="#ffffff" stroke="#2d5aa0" stroke-width="1.6"/><text x="394.5" y="266" font-size="11" text-anchor="middle" font-weight="600" fill="#2d5aa0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">SDA</text>
+<text x="460" y="298" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GPIO7</text>
+<line x1="420" y1="294" x2="450" y2="294" stroke="#2d5aa0" stroke-width="2"/>
+<polygon points="420,294 412,284 377,284 377,304 412,304" fill="#ffffff" stroke="#2d5aa0" stroke-width="1.6"/><text x="394.5" y="298" font-size="11" text-anchor="middle" font-weight="600" fill="#2d5aa0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">SCL</text>
+<text x="460" y="330" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GPIO8</text>
+<line x1="420" y1="326" x2="450" y2="326" stroke="#6a665b" stroke-width="2"/>
+<polygon points="420,326 412,316 377,316 377,336 412,336" fill="#ffffff" stroke="#6a665b" stroke-width="1.6"/><text x="394.5" y="330" font-size="11" text-anchor="middle" font-weight="600" fill="#6a665b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">LED</text>
+<text x="460" y="362" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GPIO9</text>
+<line x1="420" y1="358" x2="450" y2="358" stroke="#6a665b" stroke-width="2"/>
+<polygon points="420,358 412,348 368,348 368,368 412,368" fill="#ffffff" stroke="#6a665b" stroke-width="1.6"/><text x="390.0" y="362" font-size="11" text-anchor="middle" font-weight="600" fill="#6a665b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">BOOT</text>
+<text x="460" y="394" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GPIO10</text>
+<line x1="420" y1="390" x2="450" y2="390" stroke="#1d5b57" stroke-width="2"/>
+<polygon points="420,390 412,380 377,380 377,400 412,400" fill="#ffffff" stroke="#1d5b57" stroke-width="1.6"/><text x="394.5" y="394" font-size="11" text-anchor="middle" font-weight="600" fill="#1d5b57" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">LRC</text>
+<text x="460" y="426" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GPIO20</text>
+<line x1="420" y1="422" x2="450" y2="422" stroke="#6b3fa0" stroke-width="2"/>
+<polygon points="420,422 412,412 377,412 377,432 412,432" fill="#ffffff" stroke="#6b3fa0" stroke-width="1.6"/><text x="394.5" y="426" font-size="11" text-anchor="middle" font-weight="600" fill="#6b3fa0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">PAN</text>
+<text x="460" y="458" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GPIO21</text>
+<line x1="420" y1="454" x2="450" y2="454" stroke="#1d5b57" stroke-width="2"/>
+<polygon points="420,454 412,444 377,444 377,464 412,464" fill="#ffffff" stroke="#1d5b57" stroke-width="1.6"/><text x="394.5" y="458" font-size="11" text-anchor="middle" font-weight="600" fill="#1d5b57" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">DIN</text>
+<text x="640" y="234" font-size="12" text-anchor="end" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">5V</text>
+<line x1="650" y1="230" x2="680" y2="230" stroke="#b3361a" stroke-width="2"/>
+<polygon points="680,230 688,220 714,220 714,240 688,240" fill="#ffffff" stroke="#b3361a" stroke-width="1.6"/><text x="701.0" y="234" font-size="11" text-anchor="middle" font-weight="600" fill="#b3361a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">5V</text>
+<text x="640" y="266" font-size="12" text-anchor="end" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GND</text>
+<line x1="650" y1="262" x2="680" y2="262" stroke="#1b1a17" stroke-width="2"/>
+<polygon points="680,262 688,252 723,252 723,272 688,272" fill="#ffffff" stroke="#1b1a17" stroke-width="1.6"/><text x="705.5" y="266" font-size="11" text-anchor="middle" font-weight="600" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GND</text>
+<text x="640" y="298" font-size="12" text-anchor="end" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">3V3</text>
+<line x1="650" y1="294" x2="680" y2="294" stroke="#b3361a" stroke-width="2"/>
+<polygon points="680,294 688,284 723,284 723,304 688,304" fill="#ffffff" stroke="#b3361a" stroke-width="1.6"/><text x="705.5" y="298" font-size="11" text-anchor="middle" font-weight="600" fill="#b3361a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">3V3</text>
+<text x="640" y="330" font-size="12" text-anchor="end" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GPIO4</text>
+<line x1="650" y1="326" x2="680" y2="326" stroke="#3d7a2a" stroke-width="2"/>
+<polygon points="680,326 688,316 741,316 741,336 688,336" fill="#ffffff" stroke="#3d7a2a" stroke-width="1.6"/><text x="714.5" y="330" font-size="11" text-anchor="middle" font-weight="600" fill="#3d7a2a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">TOUCH</text>
+<text x="640" y="362" font-size="12" text-anchor="end" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GPIO3</text>
+<line x1="650" y1="358" x2="680" y2="358" stroke="#3d7a2a" stroke-width="2"/>
+<polygon points="680,358 688,348 741,348 741,368 688,368" fill="#ffffff" stroke="#3d7a2a" stroke-width="1.6"/><text x="714.5" y="362" font-size="11" text-anchor="middle" font-weight="600" fill="#3d7a2a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">XSHUT</text>
+<text x="640" y="394" font-size="12" text-anchor="end" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GPIO2</text>
+<line x1="650" y1="390" x2="680" y2="390" stroke="#6a665b" stroke-width="2"/>
+<polygon points="680,390 688,380 705,380 705,400 688,400" fill="#ffffff" stroke="#6a665b" stroke-width="1.6"/><text x="696.5" y="394" font-size="11" text-anchor="middle" font-weight="600" fill="#6a665b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">—</text>
+<text x="640" y="426" font-size="12" text-anchor="end" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GPIO1</text>
+<line x1="650" y1="422" x2="680" y2="422" stroke="#6b3fa0" stroke-width="2"/>
+<polygon points="680,422 688,412 732,412 732,432 688,432" fill="#ffffff" stroke="#6b3fa0" stroke-width="1.6"/><text x="710.0" y="426" font-size="11" text-anchor="middle" font-weight="600" fill="#6b3fa0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">TILT</text>
+<text x="640" y="458" font-size="12" text-anchor="end" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GPIO0</text>
+<line x1="650" y1="454" x2="680" y2="454" stroke="#6a665b" stroke-width="2"/>
+<polygon points="680,454 688,444 732,444 732,464 688,464" fill="#ffffff" stroke="#6a665b" stroke-width="1.6"/><text x="710.0" y="458" font-size="11" text-anchor="middle" font-weight="600" fill="#6a665b" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">VBAT</text>
+<text x="550" y="498" font-size="10.5" text-anchor="middle" font-weight="400" fill="#6a665b">GPIO2 spare: strapping pin</text>
+<rect x="40" y="120" width="170" height="152" fill="#ffffff" stroke="#1b1a17" stroke-width="1.6"/>
+<text x="50" y="140" font-size="14" text-anchor="start" font-weight="600" fill="#1b1a17">SSD1306 OLED</text>
+<text x="50" y="156" font-size="11" text-anchor="start" font-weight="400" fill="#6a665b">0.96 in, 128×64, I2C 0x3C</text>
+<text x="202" y="182" font-size="12" text-anchor="end" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">VCC</text>
+<line x1="210" y1="178" x2="236" y2="178" stroke="#b3361a" stroke-width="2"/>
+<polygon points="236,178 244,168 279,168 279,188 244,188" fill="#ffffff" stroke="#b3361a" stroke-width="1.6"/><text x="261.5" y="182" font-size="11" text-anchor="middle" font-weight="600" fill="#b3361a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">3V3</text>
+<text x="202" y="208" font-size="12" text-anchor="end" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GND</text>
+<line x1="210" y1="204" x2="236" y2="204" stroke="#1b1a17" stroke-width="2"/>
+<polygon points="236,204 244,194 279,194 279,214 244,214" fill="#ffffff" stroke="#1b1a17" stroke-width="1.6"/><text x="261.5" y="208" font-size="11" text-anchor="middle" font-weight="600" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GND</text>
+<text x="202" y="234" font-size="12" text-anchor="end" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">SDA</text>
+<line x1="210" y1="230" x2="236" y2="230" stroke="#2d5aa0" stroke-width="2"/>
+<polygon points="236,230 244,220 279,220 279,240 244,240" fill="#ffffff" stroke="#2d5aa0" stroke-width="1.6"/><text x="261.5" y="234" font-size="11" text-anchor="middle" font-weight="600" fill="#2d5aa0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">SDA</text>
+<text x="202" y="260" font-size="12" text-anchor="end" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">SCL</text>
+<line x1="210" y1="256" x2="236" y2="256" stroke="#2d5aa0" stroke-width="2"/>
+<polygon points="236,256 244,246 279,246 279,266 244,266" fill="#ffffff" stroke="#2d5aa0" stroke-width="1.6"/><text x="261.5" y="260" font-size="11" text-anchor="middle" font-weight="600" fill="#2d5aa0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">SCL</text>
+<rect x="40" y="294" width="170" height="178" fill="#ffffff" stroke="#1b1a17" stroke-width="1.6"/>
+<text x="50" y="314" font-size="14" text-anchor="start" font-weight="600" fill="#1b1a17">VL53L0X ToF</text>
+<text x="50" y="330" font-size="11" text-anchor="start" font-weight="400" fill="#6a665b">breakout, I2C 0x29, faces up</text>
+<text x="202" y="356" font-size="12" text-anchor="end" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">VIN</text>
+<line x1="210" y1="352" x2="236" y2="352" stroke="#b3361a" stroke-width="2"/>
+<polygon points="236,352 244,342 279,342 279,362 244,362" fill="#ffffff" stroke="#b3361a" stroke-width="1.6"/><text x="261.5" y="356" font-size="11" text-anchor="middle" font-weight="600" fill="#b3361a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">3V3</text>
+<text x="202" y="382" font-size="12" text-anchor="end" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GND</text>
+<line x1="210" y1="378" x2="236" y2="378" stroke="#1b1a17" stroke-width="2"/>
+<polygon points="236,378 244,368 279,368 279,388 244,388" fill="#ffffff" stroke="#1b1a17" stroke-width="1.6"/><text x="261.5" y="382" font-size="11" text-anchor="middle" font-weight="600" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GND</text>
+<text x="202" y="408" font-size="12" text-anchor="end" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">SDA</text>
+<line x1="210" y1="404" x2="236" y2="404" stroke="#2d5aa0" stroke-width="2"/>
+<polygon points="236,404 244,394 279,394 279,414 244,414" fill="#ffffff" stroke="#2d5aa0" stroke-width="1.6"/><text x="261.5" y="408" font-size="11" text-anchor="middle" font-weight="600" fill="#2d5aa0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">SDA</text>
+<text x="202" y="434" font-size="12" text-anchor="end" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">SCL</text>
+<line x1="210" y1="430" x2="236" y2="430" stroke="#2d5aa0" stroke-width="2"/>
+<polygon points="236,430 244,420 279,420 279,440 244,440" fill="#ffffff" stroke="#2d5aa0" stroke-width="1.6"/><text x="261.5" y="434" font-size="11" text-anchor="middle" font-weight="600" fill="#2d5aa0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">SCL</text>
+<text x="202" y="460" font-size="12" text-anchor="end" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">XSHUT</text>
+<line x1="210" y1="456" x2="236" y2="456" stroke="#3d7a2a" stroke-width="2"/>
+<polygon points="236,456 244,446 297,446 297,466 244,466" fill="#ffffff" stroke="#3d7a2a" stroke-width="1.6"/><text x="270.5" y="460" font-size="11" text-anchor="middle" font-weight="600" fill="#3d7a2a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">XSHUT</text>
+<rect x="40" y="494" width="170" height="126" fill="#ffffff" stroke="#1b1a17" stroke-width="1.6"/>
+<text x="50" y="514" font-size="14" text-anchor="start" font-weight="600" fill="#1b1a17">TTP223 touch</text>
+<text x="50" y="530" font-size="11" text-anchor="start" font-weight="400" fill="#6a665b">powered from 3V3 only</text>
+<text x="202" y="556" font-size="12" text-anchor="end" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">VCC</text>
+<line x1="210" y1="552" x2="236" y2="552" stroke="#b3361a" stroke-width="2"/>
+<polygon points="236,552 244,542 279,542 279,562 244,562" fill="#ffffff" stroke="#b3361a" stroke-width="1.6"/><text x="261.5" y="556" font-size="11" text-anchor="middle" font-weight="600" fill="#b3361a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">3V3</text>
+<text x="202" y="582" font-size="12" text-anchor="end" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GND</text>
+<line x1="210" y1="578" x2="236" y2="578" stroke="#1b1a17" stroke-width="2"/>
+<polygon points="236,578 244,568 279,568 279,588 244,588" fill="#ffffff" stroke="#1b1a17" stroke-width="1.6"/><text x="261.5" y="582" font-size="11" text-anchor="middle" font-weight="600" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GND</text>
+<text x="202" y="608" font-size="12" text-anchor="end" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">I/O</text>
+<line x1="210" y1="604" x2="236" y2="604" stroke="#3d7a2a" stroke-width="2"/>
+<polygon points="236,604 244,594 297,594 297,614 244,614" fill="#ffffff" stroke="#3d7a2a" stroke-width="1.6"/><text x="270.5" y="608" font-size="11" text-anchor="middle" font-weight="600" fill="#3d7a2a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">TOUCH</text>
+<rect x="890" y="110" width="180" height="204" fill="#ffffff" stroke="#1b1a17" stroke-width="1.6"/>
+<text x="900" y="130" font-size="14" text-anchor="start" font-weight="600" fill="#1b1a17">MAX98357A amp</text>
+<text x="900" y="146" font-size="11" text-anchor="start" font-weight="400" fill="#6a665b">I2S, 16 kHz, 32-bit slots</text>
+<text x="898" y="172" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">VIN</text>
+<line x1="864" y1="168" x2="890" y2="168" stroke="#b3361a" stroke-width="2"/>
+<polygon points="864,168 856,158 830,158 830,178 856,178" fill="#ffffff" stroke="#b3361a" stroke-width="1.6"/><text x="843.0" y="172" font-size="11" text-anchor="middle" font-weight="600" fill="#b3361a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">5V</text>
+<text x="898" y="198" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GND</text>
+<line x1="864" y1="194" x2="890" y2="194" stroke="#1b1a17" stroke-width="2"/>
+<polygon points="864,194 856,184 821,184 821,204 856,204" fill="#ffffff" stroke="#1b1a17" stroke-width="1.6"/><text x="838.5" y="198" font-size="11" text-anchor="middle" font-weight="600" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GND</text>
+<text x="898" y="224" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">BCLK</text>
+<line x1="864" y1="220" x2="890" y2="220" stroke="#1d5b57" stroke-width="2"/>
+<polygon points="864,220 856,210 812,210 812,230 856,230" fill="#ffffff" stroke="#1d5b57" stroke-width="1.6"/><text x="834.0" y="224" font-size="11" text-anchor="middle" font-weight="600" fill="#1d5b57" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">BCLK</text>
+<text x="898" y="250" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">LRC</text>
+<line x1="864" y1="246" x2="890" y2="246" stroke="#1d5b57" stroke-width="2"/>
+<polygon points="864,246 856,236 821,236 821,256 856,256" fill="#ffffff" stroke="#1d5b57" stroke-width="1.6"/><text x="838.5" y="250" font-size="11" text-anchor="middle" font-weight="600" fill="#1d5b57" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">LRC</text>
+<text x="898" y="276" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">DIN</text>
+<line x1="864" y1="272" x2="890" y2="272" stroke="#1d5b57" stroke-width="2"/>
+<polygon points="864,272 856,262 821,262 821,282 856,282" fill="#ffffff" stroke="#1d5b57" stroke-width="1.6"/><text x="838.5" y="276" font-size="11" text-anchor="middle" font-weight="600" fill="#1d5b57" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">DIN</text>
+<text x="898" y="302" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">SD</text>
+<line x1="864" y1="298" x2="890" y2="298" stroke="#b3361a" stroke-width="2"/>
+<polygon points="864,298 856,288 821,288 821,308 856,308" fill="#ffffff" stroke="#b3361a" stroke-width="1.6"/><text x="838.5" y="302" font-size="11" text-anchor="middle" font-weight="600" fill="#b3361a" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">3V3</text>
+<text x="900" y="330" font-size="11" text-anchor="start" font-weight="400" fill="#6a665b">OUT+ / OUT− → 4–8 Ω speaker</text>
+<text x="900" y="344" font-size="11" text-anchor="start" font-weight="400" fill="#6a665b">GAIN: open = 9 dB</text>
+<rect x="890" y="366" width="180" height="126" fill="#ffffff" stroke="#1b1a17" stroke-width="1.6"/>
+<text x="900" y="386" font-size="14" text-anchor="start" font-weight="600" fill="#1b1a17">SG90 pan servo</text>
+<text x="900" y="402" font-size="11" text-anchor="start" font-weight="400" fill="#6a665b">orange = signal</text>
+<text x="898" y="428" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">signal</text>
+<line x1="864" y1="424" x2="890" y2="424" stroke="#6b3fa0" stroke-width="2"/>
+<polygon points="864,424 856,414 821,414 821,434 856,434" fill="#ffffff" stroke="#6b3fa0" stroke-width="1.6"/><text x="838.5" y="428" font-size="11" text-anchor="middle" font-weight="600" fill="#6b3fa0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">PAN</text>
+<text x="898" y="454" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">V+ red</text>
+<line x1="864" y1="450" x2="890" y2="450" stroke="#c26a00" stroke-width="2"/>
+<polygon points="864,450 856,440 803,440 803,460 856,460" fill="#ffffff" stroke="#c26a00" stroke-width="1.6"/><text x="829.5" y="454" font-size="11" text-anchor="middle" font-weight="600" fill="#c26a00" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">EXT5V</text>
+<text x="898" y="480" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GND brown</text>
+<line x1="864" y1="476" x2="890" y2="476" stroke="#1b1a17" stroke-width="2"/>
+<polygon points="864,476 856,466 821,466 821,486 856,486" fill="#ffffff" stroke="#1b1a17" stroke-width="1.6"/><text x="838.5" y="480" font-size="11" text-anchor="middle" font-weight="600" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GND</text>
+<rect x="890" y="508" width="180" height="126" fill="#ffffff" stroke="#1b1a17" stroke-width="1.6"/>
+<text x="900" y="528" font-size="14" text-anchor="start" font-weight="600" fill="#1b1a17">SG90 tilt servo</text>
+<text x="900" y="544" font-size="11" text-anchor="start" font-weight="400" fill="#6a665b">orange = signal</text>
+<text x="898" y="570" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">signal</text>
+<line x1="864" y1="566" x2="890" y2="566" stroke="#6b3fa0" stroke-width="2"/>
+<polygon points="864,566 856,556 812,556 812,576 856,576" fill="#ffffff" stroke="#6b3fa0" stroke-width="1.6"/><text x="834.0" y="570" font-size="11" text-anchor="middle" font-weight="600" fill="#6b3fa0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">TILT</text>
+<text x="898" y="596" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">V+ red</text>
+<line x1="864" y1="592" x2="890" y2="592" stroke="#c26a00" stroke-width="2"/>
+<polygon points="864,592 856,582 803,582 803,602 856,602" fill="#ffffff" stroke="#c26a00" stroke-width="1.6"/><text x="829.5" y="596" font-size="11" text-anchor="middle" font-weight="600" fill="#c26a00" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">EXT5V</text>
+<text x="898" y="622" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GND brown</text>
+<line x1="864" y1="618" x2="890" y2="618" stroke="#1b1a17" stroke-width="2"/>
+<polygon points="864,618 856,608 821,608 821,628 856,628" fill="#ffffff" stroke="#1b1a17" stroke-width="1.6"/><text x="838.5" y="622" font-size="11" text-anchor="middle" font-weight="600" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GND</text>
+<rect x="450" y="560" width="200" height="100" fill="#ffffff" stroke="#1b1a17" stroke-width="1.6"/>
+<text x="460" y="580" font-size="14" text-anchor="start" font-weight="600" fill="#1b1a17">External 5 V, ≥ 2 A</text>
+<text x="460" y="596" font-size="11" text-anchor="start" font-weight="400" fill="#6a665b">buck supply, servos only</text>
+<text x="642" y="622" font-size="12" text-anchor="end" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">+5 V</text>
+<line x1="650" y1="618" x2="676" y2="618" stroke="#c26a00" stroke-width="2"/>
+<polygon points="676,618 684,608 737,608 737,628 684,628" fill="#ffffff" stroke="#c26a00" stroke-width="1.6"/><text x="710.5" y="622" font-size="11" text-anchor="middle" font-weight="600" fill="#c26a00" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">EXT5V</text>
+<text x="642" y="648" font-size="12" text-anchor="end" font-weight="400" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GND</text>
+<line x1="650" y1="644" x2="676" y2="644" stroke="#1b1a17" stroke-width="2"/>
+<polygon points="676,644 684,634 719,634 719,654 684,654" fill="#ffffff" stroke="#1b1a17" stroke-width="1.6"/><text x="701.5" y="648" font-size="11" text-anchor="middle" font-weight="600" fill="#1b1a17" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">GND</text>
+<text x="450" y="678" font-size="11" text-anchor="start" font-weight="400" fill="#6a665b">470–1000 µF across EXT5V/GND at the servos.</text>
+<text x="450" y="693" font-size="11" text-anchor="start" font-weight="600" fill="#b3361a">GND is common to every module and the supply.</text>
+<text x="40" y="744" font-size="12" text-anchor="start" font-weight="600" fill="#1b1a17">Nets</text>
+<line x1="100" y1="740" x2="124" y2="740" stroke="#2d5aa0" stroke-width="3"/>
+<text x="130" y="744" font-size="11" text-anchor="start" font-weight="400" fill="#1b1a17">I2C</text>
+<line x1="250" y1="740" x2="274" y2="740" stroke="#1d5b57" stroke-width="3"/>
+<text x="280" y="744" font-size="11" text-anchor="start" font-weight="400" fill="#1b1a17">I2S audio</text>
+<line x1="400" y1="740" x2="424" y2="740" stroke="#6b3fa0" stroke-width="3"/>
+<text x="430" y="744" font-size="11" text-anchor="start" font-weight="400" fill="#1b1a17">servo PWM</text>
+<line x1="550" y1="740" x2="574" y2="740" stroke="#3d7a2a" stroke-width="3"/>
+<text x="580" y="744" font-size="11" text-anchor="start" font-weight="400" fill="#1b1a17">digital in</text>
+<line x1="700" y1="740" x2="724" y2="740" stroke="#b3361a" stroke-width="3"/>
+<text x="730" y="744" font-size="11" text-anchor="start" font-weight="400" fill="#1b1a17">power</text>
+<line x1="850" y1="740" x2="874" y2="740" stroke="#c26a00" stroke-width="3"/>
+<text x="880" y="744" font-size="11" text-anchor="start" font-weight="400" fill="#1b1a17">servo power</text>
+</g></svg>

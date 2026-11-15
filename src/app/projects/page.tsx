@@ -6,7 +6,7 @@ import { absoluteUrl } from "@/lib/site";
 
 export const metadata: Metadata = {
   title: "Projects",
-  description: "Case studies of personal engineering projects: a browser-based architecture simulator, an offline BLE peer-to-peer app and an ESP32 desktop robot.",
+  description: "Technical case studies of personal engineering projects: problem, design, architecture, issues and fixes, and what is still restricted. A browser-based architecture simulator, an offline BLE peer-to-peer app and an ESP32-C3 desk robot.",
   alternates: { canonical: absoluteUrl("/projects/") },
 };
 
@@ -19,12 +19,12 @@ export default function Page() {
         <p className="section-no md:col-span-2">§ Projects</p>
         <div className="md:col-span-8">
           <h1 className="font-serif text-5xl md:text-6xl font-medium tracking-tight leading-[1.02]">Built, then written up honestly.</h1>
-          <p className="mt-5 max-w-xl text-ink-2">Each case study separates what is implemented from what is only planned, and says how each claim was verified. Status markers follow one vocabulary: implemented, demonstrated, in progress, planned, exploratory.</p>
+          <p className="mt-5 max-w-xl text-ink-2">Each project is a technical case study: the problem, the design and its trade-offs, high- and low-level architecture, the issues I hit and how I fixed them, and the scope that is planned but not built yet. Hardware projects double as build guides.</p>
         </div>
       </header>
       {lead && (
         <Link href={`/projects/${lead.slug}/`} className="group grid gap-8 border-y-2 border-ink py-10 md:grid-cols-12">
-          <div className="md:col-span-4 space-y-2"><p className="section-no">01 · {lead.meta.year}</p><StatusBadge status={lead.meta.status} /><p className="meta">{lead.meta.category}</p></div>
+          <div className="md:col-span-4 space-y-2"><p className="section-no">01 · {lead.meta.started.slice(0, 4)}</p><StatusBadge status={lead.meta.status} /><p className="meta">{lead.meta.category}</p></div>
           <div className="md:col-span-8">
             <h2 className="font-serif text-4xl md:text-5xl font-medium tracking-tight leading-none group-hover:underline decoration-signal decoration-2 underline-offset-8">{lead.meta.title}</h2>
             <p className="mt-5 max-w-2xl text-xl text-ink-2 leading-snug">{lead.meta.summary}</p>
@@ -41,7 +41,7 @@ export default function Page() {
                 <h2 className="font-serif text-3xl leading-tight font-medium group-hover:underline decoration-signal decoration-2 underline-offset-4">{p.meta.title}</h2>
                 <p className="mt-2 text-ink-2">{p.meta.summary}</p>
               </div>
-              <div className="md:col-span-4 md:text-right space-y-1"><StatusBadge status={p.meta.status} /><p className="meta">{p.meta.category} · {p.meta.year}</p></div>
+              <div className="md:col-span-4 md:text-right space-y-1"><StatusBadge status={p.meta.status} /><p className="meta">{p.meta.category} · {p.meta.started.slice(0, 4)}</p></div>
             </Link>
           </li>
         ))}

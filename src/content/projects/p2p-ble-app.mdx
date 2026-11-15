@@ -1,143 +1,189 @@
 ---
 title: Offline BLE Peer-to-Peer App
-summary: An offline-first social and matching app for people in the same room with no internet. Phones act as both Bluetooth LE central and peripheral, exchange signed cards and likes, and conclude matches locally.
+summary: An offline-first social and matching app for people in the same room with no internet. Phones act as both Bluetooth LE central and peripheral, exchange signed cards and likes, and conclude matches locally with no server in the room.
 status: in-progress
-statusNote: The in-room BLE flow is implemented and heavily unit-tested on a Node host. Real-radio evidence is thin, photo UI work is uncommitted, and the cloud half (accounts, sync, server verification) is not built.
+statusNote: The in-room BLE flow is implemented and heavily unit-tested on a Node host, and an Android–iPhone pair has exchanged data on real radios. Bluetooth toggle recovery is a confirmed defect, photo UI work is uncommitted, and the cloud half is not built.
+tldr:
+  - "Two phones with no network discover each other over Bluetooth LE, swap signed profile cards, like or pass, and each phone concludes a match on its own from two signed likes."
+  - "Every phone is both BLE central and peripheral; React Native drives scanning while custom Kotlin and Swift modules advertise and host the GATT server."
+  - "The protocol layer is pure TypeScript with no React Native imports, so codec, crypto, ordering and matching are tested under Node; radio decisions are extracted into testable pieces."
+  - "Real-radio debugging on a Galaxy S24 and an iPhone 14 found the hard bugs in link lifecycle, not in protocol logic; iOS connect success went from 1 of 2 to 6 of 8 over the fixes."
+  - "Not built yet - cloud accounts, post-session sync, server-side verification and abuse reports; Bluetooth off/on recovery is still broken."
 category: Mobile / networking / applied cryptography
-tags: [Bluetooth LE, React Native, Expo, Kotlin, Swift, protocol design, Ed25519, offline-first]
-year: "2026"
+tags: [Bluetooth LE, React Native, Expo, Kotlin, Swift, TypeScript, Ed25519, SQLite, offline-first]
+started: "2026-09"
 order: 2
 featured: true
-links: []
 facts:
-  - { label: "Stack", value: "Expo and React Native (TypeScript), custom Kotlin and Swift BLE peripheral module, expo-sqlite, zustand" }
+  - { label: "Stack", value: "Expo and React Native (TypeScript), react-native-ble-plx, custom Kotlin and Swift BLE peripheral module, expo-sqlite, zustand" }
   - { label: "Crypto", value: "Ed25519 signatures, X25519, HKDF-SHA256, ChaCha20-Poly1305 via the noble libraries" }
-  - { label: "Tests", value: "30 test files, 391 it() calls by static grep. Not re-run; the repo's README quotes stale counts (225 and 205)." }
-  - { label: "Size", value: "About 11.8k lines in src, 1.7k in app screens, 6.3k in tests, about 640 Kotlin and 680 Swift (working tree)" }
-  - { label: "History", value: "9 commits by one author over two days in September 2026, plus 12 uncommitted files" }
-  - { label: "Hardware seen", value: "Galaxy S24 and iPhone 14 in one trace session recorded in the project TODO; no aircraft testing evidenced" }
+  - { label: "Tests", value: "30 test files, 391 it() calls by static grep. Not re-run; the README quotes older counts." }
+  - { label: "Size", value: "About 11.8k lines in src, 1.7k in app screens, 6.3k in tests, about 640 Kotlin and 680 Swift" }
+  - { label: "Hardware seen", value: "Galaxy S24 and iPhone 14, in trace sessions recorded in the project TODO" }
 ---
 
-## Problem and context
+## Overview
 
-Picture a few hundred people on a long flight, a train, a conference floor or a campsite. They are physically close and have no internet. Bluetooth Low Energy can reach tens of metres without infrastructure, so a social or dating app could work entirely device to device: show a small profile card, like or pass, and chat if both sides liked.
+Picture a few hundred people on a long flight, a train, a conference floor or a campsite. They are physically close and have no internet. Bluetooth Low Energy reaches tens of metres with no infrastructure, so a social or matching app could work entirely device to device: show a small profile card, like or pass, and chat if both sides liked.
 
-The original three-phase idea is pre-flight signup online, in-flight discovery and chat over BLE only, and post-flight sync. Only the in-flight phase exists in code. This page is about that phase.
+This app is that idea built for real phones. Everyone in a room joins with a short room code. Phones advertise and scan at the same time, connect briefly to read each other's signed card, exchange signed likes, and each phone decides on its own that a match happened. Matched pairs chat end-to-end encrypted over the same short links. Nothing leaves the room; there is no server.
 
-## Why it exists
+The original concept has three phases: sign up online before the trip, discover and chat over Bluetooth only during it, and sync afterwards. Only the middle phase exists in code, and this page is about that phase. It is **in progress**: the protocol and in-room flow are built and tested, real radios have exchanged data, and the remaining work is radio-lifecycle robustness and the cloud half.
 
-It began as a feasibility question in a planning conversation: can two phones with no network do this at all, and can it be done in React Native by someone who knows JavaScript? The first plan was iOS-native Swift. It was then narrowed to an Android-first React Native MVP, and an iOS peripheral module was added later.
+## Problem Statement
 
-The interesting constraint is the one in the README: there is no server in the room. A match is concluded independently by each phone from two signed likes.
+### The problem
 
-## Architecture overview
+Social apps assume a server: accounts, matching, message relay and moderation all live in a backend. Without internet, all of that disappears. The people are still there, but the app is useless exactly where meeting strangers is most natural.
 
-A hard rule keeps the system testable: everything under `src/protocol/` has zero React Native or Expo imports, and a test fails if one appears. Transport is a seam. Under Node there is only a WebSocket relay transport for development; under Metro the BLE transport is added behind a runtime toggle.
+### Why it matters
 
-<Figure label="Fig. 1" caption="Layering. Protocol is pure and Node-testable. BLE decisions such as scan filtering and connection queuing are extracted from the radio code so they can be tested without a radio.">
-<FlowDiagram
-  title="Application layers"
-  steps={[
-    { label: "Protocol", sub: "codec, crypto, envelopes, Lamport order", tone: "store" },
-    { label: "Transport", sub: "BLE or dev WebSocket relay", tone: "default" },
-    { label: "Session", sub: "identity, peers, routing, outbox, image transfers", tone: "default" },
-    { label: "Stores + SQLite", sub: "matching, chat, evidence", tone: "store" },
-    { label: "Screens", sub: "expo-router, zustand", tone: "default" },
-  ]}
-/>
-</Figure>
+Offline-first social interaction is a hard distributed-systems problem in a small package. There is no clock you can trust (phones in airplane mode drift), no server to arbitrate who liked whom first, no central place to verify identity or handle abuse, and the transport is a lossy, short-range radio with small packets, platform quirks and an operating system that kills background work.
 
-Every device is both central and peripheral. It advertises a service and scans for others, and the device with the lower ephemeral id takes the central role to avoid two simultaneous dials. Connections are brief: connect, exchange, disconnect, with a cap of three to four concurrent links.
+### Who has it
 
-<SequenceDiagram
-  title="A match concluded without a server"
-  actors={["Phone A", "Phone B"]}
-  messages={[
-    { from: "Phone A", to: "Phone B", label: "read IDENTITY, read CARD" },
-    { from: "Phone B", to: "Phone A", label: "read IDENTITY, read CARD" },
-    { from: "Phone A", to: "Phone B", label: "write INBOX: signed LIKE", note: "chunked" },
-    { from: "Phone B", to: "Phone A", label: "write INBOX: signed LIKE", note: "chunked" },
-    { from: "Phone A", to: "Phone A", label: "two signed likes, so match" },
-    { from: "Phone B", to: "Phone B", label: "two signed likes, so match" },
-    { from: "Phone A", to: "Phone B", label: "encrypted MESSAGE, then ACK", dashed: true },
-  ]}
-/>
+Travellers on long flights and trains, attendees at conferences and festivals with overloaded networks, people at campsites or remote events. More generally, anyone in a crowd with no reliable connectivity.
 
-## Technology choices
+### Limits of existing options
 
-- **Expo with a dev client** rather than bare React Native, because the project owner already knew JavaScript. Custom native code lives in an Expo module.
-- **react-native-ble-plx for the central role, custom Kotlin and Swift for the peripheral role.** ble-plx cannot advertise or host a GATT server, so one TypeScript binding fronts two native implementations with no `Platform.OS` branch. A test checks that the UUID tables on each side stay in step.
-- **MessagePack plus manual chunking** for compact envelopes over a small ATT payload.
-- **noble libraries** for crypto instead of native bindings, so the same code runs in tests and on device.
-- **Raw SQL migrations on expo-sqlite.** The README once planned Drizzle; it is not in the dependencies and I do not claim it.
+- **Online dating and social apps** require internet for everything, including showing a profile.
+- **AirDrop and Nearby Share** move files between people who already decided to share; they do not do discovery, consent or matching.
+- **Mesh chat apps** relay messages across a crowd but are built for broadcast or group chat, not mutual consent before contact.
+- **Classic Bluetooth pairing** needs user interaction per device and does not scale to a room.
 
-## Protocol and size budgets
+### Goals and requirements
 
-One GATT service carries four characteristics. UUIDs are not secrets, but the tables below show roles only.
+| Goal | Requirement |
+|---|---|
+| Works with no network | Discovery, cards, likes, matching and chat over BLE only |
+| No server in the room | A match is concluded independently by both phones from two signed likes |
+| Consent before contact | Chat opens only after a mutual like; blocking is local and final |
+| Tamper evidence | Every decision is a signed envelope verified over the exact received bytes |
+| Privacy between sessions | On-air identity changes per session so an observer cannot link sessions |
+| Cross-platform | Android and iOS phones interoperate |
+| Testable | Protocol, matching and storage tested without a radio |
+
+## Proposed Solution
+
+### Approach
+
+Every phone is both a BLE **central** (scans and connects) and a **peripheral** (advertises and serves a GATT service). Links are short-lived: connect, exchange what is pending, disconnect, with at most three or four links at once. To avoid two phones dialling each other simultaneously, the one with the lower ephemeral id takes the central role.
+
+On top of the radio sits a small protocol: a profile card (up to 512 bytes, signed) is readable from the GATT service, and everything else travels as **signed, chunked MessagePack envelopes** written to the peer's inbox or notified from our outbox. Likes and passes are signed decisions. When a phone holds both its own like and the peer's signed like, it records a match locally. Chat messages are encrypted to a per-conversation key and ordered by a Lamport counter.
+
+### How it answers each requirement
+
+- **No network:** discovery, card exchange, decisions and chat are all GATT reads, writes and notifications.
+- **No server:** matching is a pure function over two signed likes held by each phone.
+- **Consent:** message envelopes are only accepted from matched peers; blocking stops all exchange and is terminal.
+- **Tamper evidence:** signatures are verified over the received bytes before decoding; malformed input returns false instead of throwing.
+- **Privacy:** an ephemeral key per session is derived from the long-term key with the session id as salt.
+- **Cross-platform:** one TypeScript binding fronts a Kotlin and a Swift peripheral implementation with the same UUID tables, checked by a test.
+- **Testable:** the protocol directory has zero React Native or Expo imports, enforced by a test; a WebSocket relay transport and a headless peer CLI let full sessions run on a laptop.
+
+### Key features
+
+- Join a room with a short code; see nearby people as cards with a ThumbHash placeholder and an avatar pulled on request.
+- Like or pass; matches appear on both phones without a server.
+- End-to-end encrypted chat with delivery acknowledgements.
+- Up to two display photos per profile, transferred block by block and resumable across links.
+- Go invisible, local block, and a diagnostics screen with a tagged BLE trace.
+
+### Technical decisions and trade-offs
+
+| Decision | Why | Trade-off | Alternative considered |
+|---|---|---|---|
+| Expo with a dev client | Owner knew JavaScript; native code still possible as an Expo module | Native modules to maintain for two platforms | iOS-native Swift (the first plan); bare React Native |
+| ble-plx for central, custom native for peripheral | ble-plx cannot advertise or host a GATT server | Two native implementations | A full native BLE stack per platform |
+| Brief connections, 3–4 at once | Phones limit concurrent links; short links survive movement better | Reconnect cost for every exchange | Persistent links per peer |
+| Lamport counter, sender key as tiebreak | Airplane-mode clocks are not synchronized | No wall-clock times in chat order | Device timestamps |
+| Verify signature before decode | Malformed or hostile bytes never reach the decoder | Must keep exact received bytes | Decode, then verify a re-encoding |
+| MessagePack with a 4-byte chunk header | Compact over a small ATT payload | Custom framing to test | JSON; protobuf |
+| noble crypto libraries in JavaScript | Same code in tests and on device | Slower than native crypto | Native crypto bindings |
+| Raw SQL migrations on expo-sqlite | Small schema, full control | Hand-written migrations | Drizzle (planned in an early README, never adopted) |
+| Evidence stored verbatim, never deleted | Foundation for offline abuse reports | Storage grows per session | Discard envelopes after processing |
+
+## Architecture
+
+### High-level design
+
+Each phone is a full node: UI, session logic, protocol, storage and both BLE roles. The diagram shows one phone in detail and its peers; the dashed cloud is the planned post-session half that does not exist yet.
+
+```mermaid
+flowchart TB
+    subgraph Phone["Phone (React Native app)"]
+        UI["Screens: onboarding, discover, matches, chat, diagnostics"]
+        STORE[zustand app store]
+        SM[SessionManager]
+        PROTO["Protocol: codec, crypto, envelopes, Lamport, images"]
+        MATCH[Match and chat stores]
+        DB[(SQLite)]
+        SEC[(Secure store: long-term key)]
+        subgraph Transport
+            CENTRAL["Central role: react-native-ble-plx"]
+            PERIPH["Peripheral role: Kotlin / Swift module"]
+        end
+    end
+    PEERS(("Nearby phones"))
+    CLOUD["Cloud: accounts, sync, verification (planned)"]
+    UI <--> STORE <--> SM
+    SM --> PROTO
+    SM --> MATCH --> DB
+    SM --> SEC
+    SM <--> CENTRAL
+    SM <--> PERIPH
+    CENTRAL <-->|"scan, connect, read, write"| PEERS
+    PERIPH <-->|"advertise, GATT server, notify"| PEERS
+    SM -.-> CLOUD
+```
+
+For development the transport is a seam: under Node a WebSocket relay transport and a headless peer CLI replace the radio, so whole sessions (cards, likes, matches, chat, images) run on a laptop. Under Metro, the BLE transport is added behind a runtime toggle.
+
+### Low-level design
+
+**GATT service.** One service carries four characteristics. UUIDs are not secrets, but only roles are shown here.
 
 | Characteristic | Property | Role |
 |---|---|---|
-| IDENTITY | read | ephemeral public key, used when advertising cannot carry it |
-| CARD | read, chunked | signed profile card, up to 512 bytes |
-| INBOX | write with response, chunked | peer to us: envelopes |
-| OUTBOX | notify | us to peer: envelopes |
+| IDENTITY | read | Ephemeral public key, for peers whose advertisement cannot carry it |
+| CARD | read, chunked | Signed profile card, up to 512 bytes |
+| INBOX | write with response, chunked | Peer to us: envelopes |
+| OUTBOX | notify | Us to peer: envelopes |
 
-| Envelope kind | Purpose |
+**Envelope kinds.**
+
+| Kind | Purpose |
 |---|---|
-| LIKE, PASS | the two signed decisions |
-| MESSAGE, ACK | encrypted chat and delivery confirmation |
-| IMAGE_OFFER, IMAGE_REQUEST, IMAGE_BLOCK, IMAGE_DONE | pull-based photo transfer |
+| LIKE, PASS | The two signed decisions |
+| MESSAGE, ACK | Encrypted chat and delivery confirmation |
+| IMAGE_OFFER, IMAGE_REQUEST, IMAGE_BLOCK, IMAGE_DONE | Pull-based photo transfer |
 
-| Constant | Value | Why it is that number |
-|---|---|---|
-| Card | 512 B | maximum ATT attribute size |
-| Envelope | 4096 B | caps reassembly memory |
-| Reassembled message | 64 KB | codec-level cap |
-| Image block | 3072 B | fits a few chunks at the iOS MTU |
-| Thumbnail | 16 KB limit | per-thumbnail ceiling |
-| Display image | 300 KB | per-image ceiling |
-| Blocks per request | 16 | bounds one pull |
-| Chunk header | 4 B | message id u16, sequence u8, flags u8 |
-| Negotiated MTU | 185 on iOS, 517 requested on Android | the iOS value was measured |
+**Discovery to match.** Read the sequence top to bottom: both phones read each other's identity and card, each writes a signed like into the other's inbox, and each concludes the match locally. No message says "you matched".
 
-These are protocol constants from the code, not performance results. The planning document's range and throughput figures (metres, KB per second, battery per hour) are estimates, not measurements.
+```mermaid
+sequenceDiagram
+    participant A as Phone A (central)
+    participant B as Phone B (peripheral)
+    Note over A,B: both advertise and scan, lower ephemeral id dials
+    A->>B: connect, negotiate MTU
+    A->>B: read IDENTITY (iOS peers cannot advertise it)
+    A->>B: read CARD (chunked, signed)
+    A->>A: verify signature over received bytes
+    A->>B: write INBOX: signed LIKE (chunked)
+    B-->>A: notify OUTBOX: signed LIKE
+    A->>A: own like + peer like = match
+    B->>B: own like + peer like = match
+    A->>B: write INBOX: MESSAGE (encrypted to conversation key)
+    B-->>A: notify OUTBOX: ACK
+    A->>B: disconnect
+```
 
-## Design decisions and trade-offs
+**Advertising asymmetry.** Android puts an 8-byte ephemeral id in the advertisement's service data (in the scan response, because the 31-byte legacy advertisement overflows). iOS Core Bluetooth can only advertise a local name and service UUIDs, so iOS peers are identified after connecting by reading IDENTITY. That costs one read per new iOS peer.
 
-**Chunk header amended from 3 to 4 bytes.** The first design used a u8 message id, which wraps after 256 messages, so a late chunk from an old message could be glued onto a new one. Moving to a u16 id and suppressing recently completed ids costs one byte per chunk, a fair trade.
-
-**Advertising asymmetry.** Android can put an 8-byte ephemeral id in service data. iOS CoreBluetooth can only advertise a local name and service UUIDs, so iOS peers are identified after connecting, by reading IDENTITY. On Android the data goes in the scan response because the 31-byte legacy advertisement overflows; that is arithmetic from the README, not an experiment.
-
-**Order without clocks.** Messages are ordered by a per-conversation Lamport counter with the sender key as a tiebreak. Wall clocks are never used, because phones in airplane mode are not synchronized.
-
-**Verify before decode.** Signatures are checked over the exact received bytes and only then decoded, and verification returns false on malformed input rather than throwing.
-
-**Ephemeral identity per session.** The on-air key is derived from the long-term key with the session id as salt. An observer cannot link one session to another, but the owner can regenerate it deterministically.
-
-**Evidence store.** Envelopes are stored verbatim with their signatures and never deleted. Blocking is local and terminal. This was designed for an offline abuse-report queue, but see the status table: reports are not built.
-
-<Callout type="warning" title="Security caveat I found while reading the code">
-The session id is a hash of a room code, and the ephemeral key is derived from the session id. The room code is therefore the only gate into a room. Anyone who guesses a short code joins. The app authenticates keys, not room membership, and I do not describe it as authenticating the room.
-</Callout>
-
-<Callout type="note" title="Docs versus code on photos">
-The README and plan say photos are never on the air and are revealed only post-match. The code says otherwise: `slotRequiresMatch` returns false for every slot, so photos are served to anyone in range who asks. The image design is tiered: a ThumbHash in the card, an avatar thumbnail pulled on request, and up to two display images. Display images are encrypted to the conversation key; the avatar is plaintext. I describe the code, and the README is out of date.
-</Callout>
-
-## Engineering challenges
-
-**Putting decisions where Node can test them.** The BLE transport itself cannot run under Node. The fix was to extract logic from it: `ScanGuard` for scan filtering, `LinkRegistry` for which link belongs to whom, `ConnectionQueue` for coalescing sends. A coalescing bug in the queue was found and corrected in the image plan: sending a batch connects once per window, not once per envelope.
-
-**Pull, never push.** Images are requested block by block, with declared size and hash checks, dimension caps read from the header (2048 px edge, 4 MP), request-rate limits, and refusal for blocked peers. The resumable block bitmap lives in SQLite, and bytes stay NULL until the hash verifies.
-
-**A debugging lesson.** The TODO records iOS connect success going from 1 of 2 to 2 of 5 to 6 of 8 across fixes, with four sends of 220 B in a 896 s window. The lesson written there is the useful part: "component X never does Y" turned out to be a fault two layers down; a later commit message says simply that iOS was sending all along. A count like 6 of 8 is a trace session, not a benchmark.
-
-## Implementation details
-
-The chunk header, sketched (illustrative, not the project's code):
+**Chunking.** Each chunk carries a 4-byte header: a 16-bit message id, an 8-bit sequence number and an 8-bit flags byte with a last-chunk flag. Recently completed ids are suppressed so a late chunk from an old message cannot be glued onto a new one.
 
 ```ts
-// title: chunk framing, simplified
+// title: chunk framing, simplified (illustrative, not the project's code)
 const HEADER = 4;
 export function chunk(msgId: number, bytes: Uint8Array, mtu: number): Uint8Array[] {
   const room = mtu - 3 - HEADER;              // ATT overhead, then our header
@@ -154,25 +200,210 @@ export function chunk(msgId: number, bytes: Uint8Array, mtu: number): Uint8Array
 }
 ```
 
-The data model uses a `PRAGMA user_version` ladder, v1 for core tables and v2 for images. Cards are content-addressed by hash, and `match_state` holds outgoing and incoming signed likes, passes and blocks.
+**Size budgets.** These are protocol constants from the code, not performance results.
 
-## Implemented, in progress, planned
+| Constant | Value | Why |
+|---|---|---|
+| Card | 512 B | Maximum ATT attribute size |
+| Envelope | 4096 B | Caps reassembly memory |
+| Reassembled message | 64 KB | Codec-level cap |
+| Image block | 3072 B | A few chunks at the iOS MTU |
+| Thumbnail | 16 KB max | Per-thumbnail ceiling |
+| Display image | 300 KB max | Per-image ceiling |
+| Blocks per request | 16 | Bounds one pull |
+| Negotiated MTU | 185 on iOS (measured), 517 requested on Android | Platform limits |
 
-| Evidence label | Items |
-|---|---|
-| Implemented | Protocol layer (codec, crypto, envelopes, Lamport, sessions); matching and chat stores; SQLite storage with migrations; loopback transport and headless peer CLI; BLE transport with Android and iOS peripheral modules; image tiers and resumable transfer; onboarding, discover, matches, chat and diagnostics screens; local block; go-invisible |
-| In progress | Photo UI across several screens (uncommitted, 12 files); an uncommitted Android change that removes the advertiser restart logic, which an earlier commit added so the advertiser returns after backgrounding. Which behavior I intend is unresolved; BT off-and-on recovery is a confirmed defect |
-| Planned | Cloud accounts and post-flight sync (the folders exist, empty); server-side match verification; identity binding upload (builder and verifier exist, no upload path); offline abuse reports with signed evidence (design only, no code found) |
+**Image transfer.** Images are pulled, never pushed. A card carries a ThumbHash (a few bytes rendered as a blurred placeholder); the avatar thumbnail and up to two display images are offered and then requested block by block. The receiver persists a bitmap of received blocks in SQLite, so a transfer resumes on the next link, and keeps bytes NULL until the hash verifies.
 
-Out of scope by decision: background discovery, mesh relay, group chat, voice and video.
+```mermaid
+sequenceDiagram
+    participant R as Receiver
+    participant S as Sender
+    S->>R: IMAGE_OFFER (slot, size, hash)
+    R->>R: check caps (edge 2048 px, 4 MP), rate limits, not blocked
+    loop until all blocks received (resumable across links)
+        R->>S: IMAGE_REQUEST (up to 16 missing block indexes)
+        S-->>R: IMAGE_BLOCK x n (3072 B each)
+        R->>R: mark blocks in SQLite bitmap
+    end
+    R->>R: verify hash, then store bytes
+    S->>R: IMAGE_DONE
+```
 
-## Lessons learned
+**Storage.** SQLite with a `PRAGMA user_version` ladder: v1 for core tables, v2 for images. Cards are content-addressed by hash; envelopes are stored verbatim with signatures.
 
-- **Keep the radio thin.** Nearly every bug fixed so far was either in logic that I could move to Node and test, or in radio-lifecycle code that I cannot, and the second kind cost the most.
-- **Docs rot faster than code.** Three documents disagree with the code on photo gating, test counts and interop status. The code is the source of truth, and a status table needs a date.
-- **Count what you ran.** The 391 figure is a static grep; I have not run the suite for this page.
-- **Name what a gate really gates.** The room-code finding came from tracing key derivation, not from the README.
+```mermaid
+erDiagram
+    SESSION ||--o{ PEER : "seen in"
+    PEER ||--o{ CARD : "published (by hash)"
+    PEER ||--|| MATCH_STATE : has
+    MATCH_STATE {
+        blob outgoing_decision "signed LIKE or PASS"
+        blob incoming_decision "signed LIKE or PASS"
+        bool blocked
+    }
+    PEER ||--o{ ENVELOPE : "sent or received (verbatim, signed)"
+    PEER ||--o{ MESSAGE : "chat (Lamport ordered)"
+    PEER ||--o{ IMAGE : "slots"
+    IMAGE {
+        int slot
+        int size
+        blob hash
+        blob block_bitmap
+        blob bytes "NULL until hash verifies"
+    }
+```
 
-## What's next
+**Peripheral lifecycle.** The most damaging bug lived here (see Issues & Fixes): leaving the app tore the peripheral down with no path back.
 
-Resolve the advertiser question with a hardware test before committing the working tree. Fix Bluetooth off-and-on recovery. Handle the Android rotating address that made one phone appear as five iOS peripherals in about sixteen minutes. Fix the README status table. Longer term: add a per-room secret to the session derivation so the room code is not the only gate, and only then build the cloud half. I have no evidence of users, store listings or in-flight testing, and this page makes no claim of any.
+```mermaid
+stateDiagram-v2
+    [*] --> Stopped
+    Stopped --> WaitingForRadio: join room
+    WaitingForRadio --> Advertising: PoweredOn / open GATT server, advertise, scan
+    Advertising --> Backgrounded: app leaves screen / peripheral torn down
+    Backgrounded --> Advertising: app returns / restorePeripheral (fixed)
+    Advertising --> RadioLost: Bluetooth off or stack reset
+    RadioLost --> RadioLost: no subscription watches the adapter (open defect)
+    Advertising --> Stopped: leave room
+```
+
+## Implementation
+
+### Technology stack
+
+Expo and React Native in TypeScript, expo-router, zustand for app state, react-native-ble-plx for the central role, a custom Expo module with Kotlin (Android advertiser and GATT server) and Swift (iOS peripheral server) behind one TypeScript binding, expo-sqlite with raw migrations, the platform secure store for the long-term key, and the noble libraries for Ed25519, X25519, HKDF-SHA256 and ChaCha20-Poly1305.
+
+### Important implementation decisions
+
+- **Protocol purity is enforced by a test.** Anything under `src/protocol/` that imports React Native or Expo fails the suite.
+- **Decisions are extracted from radio code.** `ScanGuard` (scan filtering), `LinkRegistry` (which link belongs to which peer) and `ConnectionQueue` (coalescing sends into one connection per window) are plain TypeScript with tests; the BLE transport that cannot load under Node stays thin.
+- **Teardown is keyed to the device,** not to a single connection handle, because on iOS several Core Bluetooth handles can be one phone on one link.
+- **Errors carry the radio's own reason.** `bleErrors.ts` names platform error codes (for example Android's scan-throttling code) so a toast or log says what actually failed.
+- **Ephemeral identity per session.** The on-air key is derived from the long-term key with the session id as salt: unlinkable across sessions, reproducible by the owner.
+
+### Authentication and authorization
+
+Identity is a key pair, not an account. Every card and decision is signed; chat is encrypted to a conversation key derived from both parties. Authorization is local: envelopes from unmatched or blocked peers are refused, and image requests respect per-slot rules and rate limits. There is no account system yet; an identity-binding builder and verifier exist for the planned cloud phase, with no upload path.
+
+<Callout type="warning" title="The room code is the only gate">
+The session id is a hash of the room code, and the ephemeral key is derived from the session id. Anyone who guesses a short code joins the room. The app authenticates keys and decisions, not room membership, and I do not describe it as authenticating the room. A per-room secret is on the roadmap.
+</Callout>
+
+<Callout type="note" title="Photos: the code, not the README">
+Early documents say photos are never on the air and are revealed only after a match. The code differs: the slot gate returns false for every slot, so photos are served to anyone in range who asks. Display images are encrypted to the conversation key; the avatar thumbnail is plaintext. I describe the code.
+</Callout>
+
+### Testing strategy
+
+- **Node unit tests** for codec, chunking, crypto, envelopes, Lamport ordering, session codes, image tiers, matching, storage migrations, session manager and the extracted radio decisions: 30 test files and 391 `it()` calls by static grep (not re-run for this page).
+- **Loopback sessions:** a WebSocket hub and a headless peer CLI run multi-peer sessions on one laptop with no radio.
+- **Hardware trace sessions:** a Galaxy S24 and an iPhone 14 with a tagged BLE trace per device, plus Android's own Bluetooth stack log. The measured results are in the TODO and below; they are trace sessions, not benchmarks.
+- **Not covered:** the background and foreground cycle (the most damaging bug had zero coverage), Bluetooth toggling, and anything on an actual flight.
+
+## Issues & Fixes
+
+### iOS seemed never to send
+
+**Problem.** Across four trace windows, the iPhone sent 0 envelopes in over 18 minutes while the Android phone sent 15 or more in the same rooms. It looked like a defect in the session layer above the transport.
+
+**Root cause.** Two layers down. Forgetting a stale connection handle hung up on the peer, and on iOS separate Core Bluetooth handles are one phone on one link. So every connect timeout on a stale handle killed the live connection about 0.4 seconds later, and iOS never had a link that stayed up long enough to send.
+
+**Fix.** Key teardown to the device instead of the handle, so forgetting a dead handle no longer hangs up on the live one. On the final build, iOS sent four envelopes of 220 bytes in an 896-second window, each write taking 0.1–1.2 s, and iOS connect success across the fixes went from 1 of 2 to 2 of 5 to 6 of 8, with no "operation was cancelled" errors.
+
+**Lesson.** "Component X never does Y" was a symptom of a fault two layers down. Four windows of evidence pointed at the session layer. Measure the link before blaming the caller.
+
+### The phone became undiscoverable after a glance at another app
+
+**Problem.** After switching to another app and back, the phone stayed in the room in the UI but no one could find it.
+
+**Root cause.** The peripheral (advertiser and GATT server) was torn down when the app went to the background, and nothing restored it on return. The scan kept running because it belongs to ble-plx, so the app looked healthy. Only the Android Bluetooth stack's own log showed the advertising set starting and then stopping, with nothing after.
+
+**Fix.** Re-arm the peripheral when the app returns to the foreground (`restorePeripheral`).
+
+**Lesson.** Every "the radio went away" path needs a way back, and the app's own state can lie about the radio. The platform's log was the only honest witness.
+
+### Dialling a peer that had already left
+
+**Problem.** Connections were attempted to addresses the peer had already abandoned, each costing a 10-second timeout and competing for a radio that runs one connect at a time.
+
+**Root cause.** Android rotates its advertising address periodically, and Core Bluetooth mints a new peripheral identifier for each. One Android phone appeared to one iPhone under 5 different identifiers in about 16 minutes.
+
+**Fix.** A connect timeout now forgets the binding (the address), not the peer, so a retired address stops being dialled. The underlying churn remains: a wasted dial and a duplicate card per rotation until identity promotion merges them.
+
+**Lesson.** On BLE, an address is not an identity. Bind identity at the protocol layer and treat addresses as disposable.
+
+### Our own unsubscribe treated as the peer leaving
+
+**Problem.** Ending a notification subscription on our side was handled as if the peer had dropped, triggering teardown.
+
+**Fix.** Distinguish self-initiated unsubscribes from peer events, so our own cleanup is not reported as the peer's fault.
+
+### Sending a batch connected once per envelope
+
+**Problem.** The connection queue was meant to coalesce sends, but a batch opened one connection per envelope.
+
+**Fix.** Corrected in the image work: sending a batch connects once per window. Multi-envelope batching has still never been observed on a real link (see restricted scope).
+
+### Chunk ids wrapped after 256 messages
+
+**Problem.** The first chunk header used an 8-bit message id, which wraps after 256 messages, so a late chunk from an old message could be glued onto a new message with the same id.
+
+**Fix.** A 16-bit message id plus suppression of recently completed ids. One extra byte per chunk.
+
+### Bluetooth off and on: still open
+
+**Problem.** If the user toggles Bluetooth, or the Android stack resets itself, the session stays "running" while the radio is gone, and nothing brings it back.
+
+**Root cause.** The radio-state subscription is created once at start and removed as soon as the radio first powers on. Nothing watches the adapter afterwards. It is the same shape as the background bug: teardown with no matching restore.
+
+**Fix (planned).** Keep a long-lived state subscription for the life of the session and re-arm exactly as `restorePeripheral` does when the radio comes back.
+
+## Learnings
+
+### Technical learnings
+
+- **Keep the radio thin.** Nearly every bug fixed so far was either in logic I could move to Node and test, or in radio-lifecycle code I could not. The second kind cost the most time.
+- **Look for teardown without restore.** Both of the worst bugs were a missing path back after the radio went away.
+- **Don't fix faults with no evidence.** I planned a debounce for scan restarts, then held it: zero scan starts had failed since instrumentation landed, and Android's stack showed a healthy scanner. The error mapping will name the throttling code if it ever appears.
+- **Name what a gate really gates.** The room-code finding came from tracing key derivation, not from reading the README.
+
+### What I would do differently
+
+- Write the hardware trace tooling (tagged per-device logs, copyable diagnostics) before the second feature, not after the first failure.
+- Extract the "should the peripheral be armed?" decision into a tested pure function from the start.
+- Keep a dated status table, generated where possible. Three documents disagree with the code on photo gating, test counts and interop status.
+
+### Known limitations
+
+- Foreground only: the OS limits background BLE, so discovery stops when the screen is off.
+- The room code is the only gate into a room.
+- Photos are served to anyone in range who requests them; only display images are encrypted.
+- One rotating Android address shows up as several peers until identity promotion merges them; stale peer rows from earlier sessions persist in storage.
+- End-to-end message latency as a user sees it is unmeasured; only transport-level write times are.
+
+## Future Improvements
+
+1. **Bluetooth toggle recovery** with a long-lived adapter subscription.
+2. **Test the background and foreground cycle** by extracting the re-arm decision into a pure, tested function.
+3. **Merge rotated addresses before dialling** and clear stale peer rows on join.
+4. **Decide the uncommitted Android advertiser change** (it removes restart logic an earlier commit added) with a hardware test, then commit the photo UI.
+5. **Verify on hardware:** multi-envelope batching, a real photo rendering on iOS, Android photo orientation.
+6. **Per-room secret** in the session derivation so the room code is not the only gate.
+7. **Then the cloud half:** accounts, post-session sync, server-side match verification and identity binding.
+
+## Planned but Restricted
+
+| Scope | State | What restricts it |
+|---|---|---|
+| Cloud accounts, photo storage, post-session sync | Planned | Not built; cloud folders exist and are empty; waiting on in-room robustness first |
+| Server-side match verification and identity binding upload | Planned | Builder and verifier exist; no backend to upload to |
+| Offline abuse reports with signed evidence | Designed only | Evidence is stored verbatim, but no report feature exists |
+| Bluetooth off/on recovery | Confirmed defect | Fix designed, not implemented |
+| Photo UI across screens | In progress | Uncommitted working-tree changes |
+| Advertiser restart behaviour on Android | Undecided | Working tree removes logic a commit added; needs a hardware test |
+| Multi-envelope batching, iOS photo rendering, Android EXIF orientation | Unverified on hardware | The two phones were rarely on the air together before the advertiser fix |
+| Room membership authentication | Restricted | Room code is the only gate until a per-room secret exists |
+| Background or screen-off discovery | Out of scope | Platform background BLE limits |
+| Mesh relay, group chat, voice and video, read receipts, identity verification | Out of scope | By decision in the plan |
+| In-flight testing, store listing | Not done | No evidence of either; no claims made |

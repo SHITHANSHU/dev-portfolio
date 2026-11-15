@@ -14,10 +14,16 @@ describe("content", () => {
     for (const a of getArticles()) for (const r of a.meta.related) expect(slugs.has(r), `${a.slug} → ${r}`).toBe(true);
   });
   it("every lab tag used in MDX is registered", () => {
-    const known = new Set([...Object.keys(labComponents), "Callout", "Figure", "Details", "Metric", "FlowDiagram", "SequenceDiagram"]);
-    for (const a of getArticles()) {
+    const known = new Set([...Object.keys(labComponents), "Callout", "Figure", "Details", "Metric", "PhotoSlot", "FlowDiagram", "SequenceDiagram"]);
+    for (const a of [...getArticles(), ...getProjects()]) {
       const stripped = a.source.replace(/```[\s\S]*?```/g, "");
       for (const m of stripped.matchAll(/<([A-Z][A-Za-z0-9]+)/g)) expect(known.has(m[1] ?? ""), `${a.slug}: <${m[1]}>`).toBe(true);
+    }
+  });
+  it("every root-relative image in project MDX exists under public/", () => {
+    for (const p of getProjects()) for (const m of p.source.matchAll(/!\[[^\]]*\]\((\/[^)\s]+)\)|src="(\/[^"]+)"/g)) {
+      const src = m[1] ?? m[2] ?? "";
+      expect(fs.existsSync(path.join(process.cwd(), "public", src)), `${p.slug}: ${src}`).toBe(true);
     }
   });
   it("heading ids are unique per document", () => {

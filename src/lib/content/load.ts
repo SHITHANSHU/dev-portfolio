@@ -96,3 +96,6 @@ export function getAdjacent(article: Article): { prev?: Article; next?: Article 
 
 export const formatDate = (iso: string): string =>
   new Date(`${iso}T00:00:00Z`).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
+
+export const formatMonth = (ym: string): string =>
+  new Date(`${ym}-01T00:00:00Z`).toLocaleDateString("en-GB", { month: "short", year: "numeric", timeZone: "UTC" });

@@ -151,8 +151,8 @@ body {
 
 /* ── Prose (articles, case studies) ── */
 .prose { max-width: none; }
-.prose > :not(.lab):not(.bleed):not(figure):not(.table-scroll):not(details) { max-width: 40rem; }
-.prose > details, .prose > .table-scroll { max-width: 48rem; }
+.prose > :not(.lab):not(.bleed):not(figure):not(.table-scroll):not(details):not(.mermaid-diagram) { max-width: 40rem; }
+.prose > details, .prose > .table-scroll, .prose > .mermaid-diagram { max-width: 48rem; }
 .prose > * + * { margin-top: 1.2em; }
 .prose h2 { font-size: 1.75rem; line-height: 1.2; letter-spacing: -.01em; font-weight: 500; margin-top: 2.8em; padding-top: .9rem; border-top: 1px solid var(--rule); }
 .prose h3 { font-size: 1.25rem; line-height: 1.3; font-weight: 600; margin-top: 2em; }
@@ -171,6 +171,18 @@ body {
 .prose td { border-bottom: 1px solid var(--rule); padding: .55rem .75rem .55rem 0; vertical-align: top; }
 .prose .table-scroll { overflow-x: auto; }
 .prose hr { border: 0; border-top: 1px solid var(--rule); margin-block: 2.5rem; }
+
+/* Case-study variant (projects): numbered sans section heads read as documentation; journal prose stays editorial. */
+.prose-doc { counter-reset: doc-h2; }
+.prose-doc h2 { counter-increment: doc-h2; font-family: var(--font-sans); font-size: 1.6rem; font-weight: 600; letter-spacing: -.015em; border-top: 2px solid var(--rule-strong); }
+.prose-doc h2::before { content: counter(doc-h2, decimal-leading-zero); display: block; margin-bottom: .35rem; font-family: var(--font-mono); font-size: .75rem; font-weight: 400; letter-spacing: .04em; color: var(--signal); }
+.prose-doc h3 { font-family: var(--font-sans); font-size: 1.15rem; }
+.prose-doc h4 { font-family: var(--font-sans); font-size: .8rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin-top: 1.4em; }
+.prose-doc figure img { width: 100%; height: auto; border: 1px solid var(--rule); background: #fbf9f4; }
+.mermaid-diagram { overflow-x: auto; border: 1px solid var(--rule); background: var(--paper); padding: 1rem; }
+.mermaid-diagram svg { display: block; margin-inline: auto; max-width: 100%; height: auto; }
+.mermaid-src { font-family: var(--font-mono); font-size: .8rem; overflow-x: auto; padding: 1rem; background: var(--code-bg); border: 1px solid var(--rule); }
+
 .drop > p:first-of-type::first-letter { font-size: 3.6em; float: left; line-height: .85; padding: .05em .1em 0 0; font-weight: 500; color: var(--signal); }
 
 /* sr-only content is absolutely positioned; scroll containers must contain it or it widens the page */

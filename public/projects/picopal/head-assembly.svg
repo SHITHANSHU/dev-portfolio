@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 520" width="1000" height="520" role="img" aria-labelledby="t d">
+<title id="t">PicoPal pan/tilt head assembly</title><desc id="d">Front view of the head: the pan servo is glued upside down with its horn on the base (joint A); the tilt servo's horn is glued to the pan servo's wide face (joint B); the OLED's back is glued to the tilt servo's front face (joint C). Pan turns ±60 degrees, tilt nods from −20 to +25 degrees.</desc>
+<rect width="1000" height="520" fill="#fbf9f4"/>
+<g font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" fill="#1b1a17">
+<text x="30" y="40" font-size="20" text-anchor="start" font-weight="600" fill="#1b1a17">PicoPal — glue-gun pan/tilt head</text>
+<text x="30" y="62" font-size="12" text-anchor="start" font-weight="400" fill="#6a665b">Three flat-on-flat joints, no bracket or 3D print. The pan servo is mounted upside down so its body turns.</text>
+<text x="60" y="100" font-size="12" text-anchor="start" font-weight="600" fill="#6a665b">FRONT VIEW (facing the screen)</text>
+<rect x="60" y="430" width="400" height="18" fill="#d9d4c6" stroke="#1b1a17" stroke-width="1.6"/>
+<text x="260" y="443" font-size="11" text-anchor="middle" font-weight="400" fill="#1b1a17">base</text>
+<rect x="100" y="420" width="70" height="10" fill="#ffffff" stroke="#b3361a" stroke-width="1.6"/>
+<rect x="90" y="300" width="90" height="120" fill="#e8e3d6" stroke="#1b1a17" stroke-width="1.6"/>
+<text x="135" y="350" font-size="13" text-anchor="middle" font-weight="700" fill="#1b1a17">PAN</text>
+<text x="135" y="366" font-size="10" text-anchor="middle" font-weight="400" fill="#6a665b">upside down</text>
+<rect x="180" y="320" width="12" height="60" fill="#ffffff" stroke="#b3361a" stroke-width="1.6"/>
+<rect x="196" y="230" width="70" height="150" fill="#e8e3d6" stroke="#1b1a17" stroke-width="1.6"/>
+<text x="231" y="300" font-size="13" text-anchor="middle" font-weight="700" fill="#1b1a17">TILT</text>
+<text x="231" y="316" font-size="9" text-anchor="middle" font-weight="400" fill="#6a665b">behind OLED</text>
+<rect x="210" y="160" width="210" height="120" fill="#ffffff" stroke="#1b1a17" stroke-width="2"/>
+<rect x="225" y="175" width="180" height="90" fill="#1b1a17"/>
+<ellipse cx="285" cy="215" rx="16" ry="20" fill="#e9f3ff"/>
+<ellipse cx="345" cy="215" rx="16" ry="20" fill="#e9f3ff"/>
+<path d="M 300 245 q 15 10 30 0" stroke="#e9f3ff" stroke-width="3" fill="none"/>
+<text x="315" y="155" font-size="10" text-anchor="middle" font-weight="400" fill="#6a665b">4 jumpers plugged before gluing</text>
+<circle cx="135" cy="432" r="11" fill="#b3361a"/>
+<text x="135" y="436" font-size="12" text-anchor="middle" font-weight="700" fill="#ffffff">A</text>
+<circle cx="186" cy="350" r="11" fill="#b3361a"/>
+<text x="186" y="354" font-size="12" text-anchor="middle" font-weight="700" fill="#ffffff">B</text>
+<circle cx="274" cy="280" r="11" fill="#b3361a"/>
+<text x="274" y="284" font-size="12" text-anchor="middle" font-weight="700" fill="#ffffff">C</text>
+<path d="M 80 280 a 55 14 0 1 0 110 0" stroke="#6b3fa0" stroke-width="2" fill="none" stroke-dasharray="4 3"/>
+<text x="40" y="255" font-size="11" text-anchor="start" font-weight="600" fill="#6b3fa0">pan: turn left/right (±60°)</text>
+<text x="430" y="310" font-size="11" text-anchor="start" font-weight="600" fill="#6b3fa0">tilt: nod</text>
+<text x="430" y="325" font-size="11" text-anchor="start" font-weight="400" fill="#6b3fa0">(−20° … +25°)</text>
+<text x="560" y="120" font-size="14" text-anchor="start" font-weight="600" fill="#1b1a17">Joints (all flat-on-flat)</text>
+<circle cx="571" cy="150" r="11" fill="#b3361a"/>
+<text x="571" y="154" font-size="12" text-anchor="middle" font-weight="700" fill="#ffffff">A</text>
+<text x="592" y="154" font-size="13" text-anchor="start" font-weight="600" fill="#1b1a17">pan horn face → base</text>
+<text x="592" y="171" font-size="11.5" text-anchor="start" font-weight="400" fill="#6a665b">rotate body to face front before it sets</text>
+<circle cx="571" cy="204" r="11" fill="#b3361a"/>
+<text x="571" y="208" font-size="12" text-anchor="middle" font-weight="700" fill="#ffffff">B</text>
+<text x="592" y="208" font-size="13" text-anchor="start" font-weight="600" fill="#1b1a17">tilt horn face → pan wide face</text>
+<text x="592" y="225" font-size="11.5" text-anchor="start" font-weight="400" fill="#6a665b">tilt body straight up, 4–5 mm gap</text>
+<circle cx="571" cy="258" r="11" fill="#b3361a"/>
+<text x="571" y="262" font-size="12" text-anchor="middle" font-weight="700" fill="#ffffff">C</text>
+<text x="592" y="262" font-size="13" text-anchor="start" font-weight="600" fill="#1b1a17">OLED back → tilt wide face</text>
+<text x="592" y="279" font-size="11.5" text-anchor="start" font-weight="400" fill="#6a665b">glue on the servo, never the glass</text>
+<text x="560" y="338" font-size="14" text-anchor="start" font-weight="600" fill="#1b1a17">Before gluing</text>
+<text x="560" y="362" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17">1. Zero both servos in firmware (head center), then head off.</text>
+<text x="560" y="381" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17">2. Do not turn the shafts after that. Mark each body.</text>
+<text x="560" y="400" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17">3. Cross-hatch horn faces and servo labels with a knife.</text>
+<text x="560" y="419" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17">4. Never glue: shaft gap, horn screw, OLED glass or ribbon.</text>
+<text x="560" y="438" font-size="12" text-anchor="start" font-weight="400" fill="#1b1a17">5. Leave 8–10 cm slack loops: the pan body turns too.</text>
+</g></svg>

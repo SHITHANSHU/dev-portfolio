@@ -41,6 +41,16 @@ export function TableWrap({ children }: { children: ReactNode }) {
   return <div className="table-scroll my-6" tabIndex={0} role="region" aria-label="Table">{children}</div>;
 }
 
+/** Marked place for a real photo that has not been taken yet. */
+export function PhotoSlot({ caption }: { caption: string }) {
+  return (
+    <figure className="my-8 border-2 border-dashed border-rule bg-paper-2 px-5 py-10 text-center font-sans">
+      <p className="meta">Photo to add</p>
+      <figcaption className="mt-2 text-sm text-ink-2">{caption}</figcaption>
+    </figure>
+  );
+}
+
 /** Label/value result chip for inline calculations in prose. */
 export function Metric({ label, value, note }: { label: string; value: string; note?: string }) {
   return (
