@@ -18,8 +18,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      NEXT_PUBLIC_BASE_PATH: /dev-portfolio
-      NEXT_PUBLIC_SITE_URL: https://shithanshu.github.io
+      NEXT_PUBLIC_SITE_URL: https://shithanshu.com
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
