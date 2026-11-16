@@ -4,7 +4,6 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { Mdx } from "@/components/content/Mdx";
 import { Toc } from "@/components/journal/Toc";
-import { StatusBadge } from "@/components/ui/StatusBadge";
 import { formatMonth, getProject, getProjects } from "@/lib/content/load";
 import { absoluteUrl } from "@/lib/site";
 
@@ -47,8 +46,7 @@ export default async function Page({ params }: { params: Promise<Params> }) {
         </div>
         <aside className="md:col-span-4 border-t-2 border-ink pt-3 font-sans text-sm" aria-label="Project facts">
           <dl className="divide-y divide-rule">
-            <Row label="Status"><StatusBadge status={meta.status} />{meta.statusNote && <span className="block mt-1 text-muted">{meta.statusNote}</span>}</Row>
-            <Row label="Timeline">{formatMonth(meta.started)} – {meta.completed ? formatMonth(meta.completed) : "ongoing"}</Row>
+            <Row label="Timeline">{formatMonth(meta.started)}{meta.completed && ` – ${formatMonth(meta.completed)}`}</Row>
             {meta.role && <Row label="Role">{meta.role}</Row>}
             <Row label="Stack">{meta.tags.join(" · ")}</Row>
             {meta.repo && <Row label="Repository"><a className="link" href={meta.repo} rel="noopener">{meta.repo.replace(/^https?:\/\//, "")}</a></Row>}

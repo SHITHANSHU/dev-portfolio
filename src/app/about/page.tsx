@@ -15,37 +15,38 @@ const roles = [
       {
         title: "Founding Engineer", span: "Mar 2024 – present",
         points: [
-          "Led end-to-end backend architecture for a multi-tenant AI platform serving smart-city and government clients, owning data modelling, API design, deployment and production operations across Python and Java services.",
-          "Designed a payment-grade financial platform: immutable ACID ledger, low-latency state management, prepaid wallets and automated reconciliation.",
-          "Engineered an in-house distributed workflow engine (Spring Boot and Node.js) handling 10M+ tasks per day, with durable state, rate limiting, back-pressure and horizontal scaling.",
-          "Built a real-time traffic-analytics pipeline on Kafka, MQTT and ksqlDB with sub-second processing latency and back-pressure handling.",
-          "Built a WebSocket notification system holding 1,000+ concurrent persistent connections for time-critical alert delivery.",
-          "Architected Spring Boot microservices for a Video Management System designed for 100k+ IP cameras with 24×7 availability and multi-tenant isolation.",
-          "Delivered ETL and change-data-capture pipelines with Debezium, Kafka and Elasticsearch for near-real-time analytics and audit trails.",
-          "Led a Kubernetes migration and GPU-enabled CI/CD shift from AWS to a private datacentre; mentored three engineers using RFC-first, documentation-first practice.",
+          "Own the backend architecture of a multi-tenant AI platform for smart-city and government clients: data model, APIs, deployment and production operations, across Python and Java services.",
+          "Designed the payments platform: an immutable ACID ledger, prepaid wallets and automated reconciliation.",
+          "Built an in-house distributed workflow engine (Spring Boot, Node.js) that runs 10M+ tasks a day, with durable state, rate limiting, back-pressure and horizontal scaling.",
+          "Built a real-time traffic-analytics pipeline on Kafka, MQTT and ksqlDB with sub-second processing latency.",
+          "Built a WebSocket notification service that holds 1,000+ concurrent connections for time-critical alerts.",
+          "Designed the Spring Boot services behind a video management system sized for 100k+ IP cameras, with 24×7 availability and per-tenant isolation.",
+          "Built CDC and ETL pipelines (Debezium, Kafka, Elasticsearch) for near-real-time analytics and audit trails.",
+          "Led the move from AWS to a private datacentre on Kubernetes, including GPU-enabled CI/CD.",
+          "Mentor three engineers. Significant changes go through a written RFC before implementation.",
         ],
       },
       {
         title: "Software Engineer", span: "Apr 2021 – Feb 2024",
         points: [
-          "Built backend services and distributed modules for intelligent traffic management and smart-city platforms, from prototype to production.",
-          "Designed low-network Python fare-calculation modules for intermittent connectivity, enforcing correctness under partial failure.",
-          "Designed a Python traffic-management solution with an MTBF above 262,000 hours.",
+          "Built backend services for traffic-management and smart-city platforms and took them from prototype to production.",
+          "Wrote fare-calculation modules in Python that stay correct on intermittent network connections.",
+          "Designed a Python traffic-management system with an MTBF above 262,000 hours.",
         ],
       },
     ],
   },
   {
     org: "Hitachi Vantara", place: "Pune", span: "Nov 2020 – Apr 2021",
-    positions: [{ title: "Associate", span: "", points: ["Built an automated monitoring and alerting system in Python for SAP applications, saving 1,000+ man-hours.", "Managed an SAP R/3 system migration and kept production operations stable."] }],
+    positions: [{ title: "Associate", span: "", points: ["Built a Python monitoring and alerting system for SAP applications that saved 1,000+ person-hours.", "Ran an SAP R/3 system migration while keeping production stable."] }],
   },
 ];
 
 const domains: [string, string][] = [
-  ["Streaming and real-time", "Kafka, MQTT, ksqlDB, Debezium CDC, WebSockets, back-pressure, long-lived connections"],
-  ["Data stores", "PostgreSQL (schema design, query optimisation, ACID), MySQL, MongoDB, Elasticsearch, Redis"],
-  ["Orchestration and commerce", "Queue-based durable task processing, event-driven state machines, ledger design, metering, reconciliation"],
-  ["Platform and operations", "Kubernetes, Docker, AWS, CI/CD, GPU pipelines, structured logging, metrics, distributed tracing"],
+  ["Streaming and real-time", "Kafka, MQTT, ksqlDB, Debezium CDC, WebSockets"],
+  ["Data stores", "PostgreSQL, MySQL, MongoDB, Elasticsearch, Redis"],
+  ["Workflows and payments", "Durable task queues, event-driven state machines, ledgers, metering, reconciliation"],
+  ["Platform and operations", "Kubernetes, Docker, AWS, CI/CD, GPU pipelines, logging, metrics, distributed tracing"],
   ["Languages and frameworks", "Python (FastAPI, Flask), Java 17+ (Spring Boot), JavaScript/Node.js"],
 ];
 
@@ -56,7 +57,7 @@ export default function Page() {
         <p className="section-no md:col-span-2">§ About</p>
         <div className="md:col-span-9">
           <h1 className="font-serif text-5xl md:text-6xl font-medium tracking-tight leading-[1.02]">{site.name}</h1>
-          <p className="mt-6 max-w-2xl font-serif text-xl leading-snug text-ink-2">Senior engineer with over five years of experience designing and operating multi-tenant distributed systems, including real-time streaming, WebSocket infrastructure and transactional platforms. Founding Engineer at Beltech AI, responsible for data modelling, API design, workflow orchestration, observability and production operations. Based in {site.location}.</p>
+          <p className="mt-6 max-w-2xl font-serif text-xl leading-snug text-ink-2">Senior engineer with over five years of building and operating multi-tenant distributed systems. Founding Engineer at Beltech AI, where I own the backend for a platform serving smart-city and government clients, from the data model and APIs through to production operations. Based in {site.location}.</p>
         </div>
       </header>
 

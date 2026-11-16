@@ -1,5 +1,4 @@
 import Link from "next/link";
-import { StatusBadge } from "@/components/ui/StatusBadge";
 import { formatDate, getArticles, getProjects } from "@/lib/content/load";
 import { site } from "@/lib/site";
 
@@ -14,9 +13,9 @@ export default function Home() {
           <div className="md:col-span-8">
             <p className="meta">{site.name} · {site.location}</p>
             <h1 className="mt-5 font-serif text-[2.7rem] leading-[1.02] font-medium tracking-tight md:text-[5.2rem] [text-wrap:balance]">
-              Backend engineer building distributed systems, streaming pipelines and video infrastructure.
+              I design and run backend systems for real-time data and video.
             </h1>
-            <p className="mt-8 max-w-xl text-xl leading-snug text-ink-2">Founding Engineer at Beltech AI, working on multi-tenant platforms, real-time data and camera analytics. I write here about system design and the trade-offs behind it.</p>
+            <p className="mt-8 max-w-xl text-xl leading-snug text-ink-2">Founding Engineer at Beltech AI, where I own the backend architecture of a multi-tenant platform for smart-city and government clients. I write here about the design decisions and failure modes behind systems like it.</p>
             <p className="mt-8 flex flex-wrap gap-x-6 gap-y-2 font-sans text-sm font-medium">
               <Link className="link" href="/journal/">Read the journal →</Link>
               <Link className="link" href="/projects/">Projects →</Link>
@@ -26,7 +25,7 @@ export default function Home() {
           <aside className="md:col-span-4 md:border-l md:border-rule md:pl-8 font-sans text-sm self-end" aria-label="At a glance">
             <p className="meta mb-3">At a glance</p>
             <dl className="divide-y divide-rule border-y border-rule">
-              {[["Now", "Founding Engineer, Beltech AI"], ["Since", "April 2021"], ["Works in", "Kafka · MQTT · ksqlDB · Debezium · PostgreSQL · Spring Boot · Python"], ["Domain", "Smart-city platforms, VMS for large camera fleets, ledgers and workflows"]].map(([k, v]) => (
+              {[["Role", "Founding Engineer, Beltech AI"], ["Since", "April 2021"], ["Stack", "Kafka · MQTT · ksqlDB · Debezium · PostgreSQL · Spring Boot · Python"], ["Domain", "Smart-city platforms, video management for large camera fleets, payments, workflow engines"]].map(([k, v]) => (
                 <div key={k} className="grid grid-cols-[4.5rem_1fr] gap-3 py-2.5"><dt className="meta pt-0.5">{k}</dt><dd>{v}</dd></div>
               ))}
             </dl>
@@ -66,8 +65,7 @@ export default function Home() {
                 <Link href={`/projects/${p.slug}/`} className="group grid items-baseline gap-x-8 gap-y-1 py-5 md:grid-cols-12">
                   <span className="section-no md:col-span-1">{String(i + 1).padStart(2, "0")}</span>
                   <span className="md:col-span-5 font-serif text-3xl leading-tight group-hover:underline decoration-signal underline-offset-4">{p.meta.title}</span>
-                  <span className="md:col-span-4 text-ink-2 text-base">{p.meta.category}</span>
-                  <span className="md:col-span-2 md:text-right"><StatusBadge status={p.meta.status} /></span>
+                  <span className="md:col-span-6 text-ink-2 text-base md:text-right">{p.meta.category}</span>
                 </Link>
               </li>
             ))}
@@ -78,8 +76,8 @@ export default function Home() {
       <section aria-labelledby="labs" className="border-t-2 border-ink">
         <div className="wrap grid gap-x-10 gap-y-4 py-12 md:grid-cols-12">
           <h2 id="labs" className="meta md:col-span-2 pt-2">Interactive labs</h2>
-          <p className="md:col-span-6 font-serif text-2xl leading-snug">Articles include interactive models: capacity calculators, partition explorers, an MQTT QoS playground and a GOP visualiser. Each one states its assumptions.</p>
-          <p className="md:col-span-4 meta normal-case tracking-normal !text-[0.85rem] leading-relaxed">All data is synthetic. The models do not connect to real systems, and their output is not benchmark data.</p>
+          <p className="md:col-span-6 font-serif text-2xl leading-snug">Most articles include an interactive model, such as a capacity calculator, a partition explorer, an MQTT QoS playground or a GOP visualiser. Each one lists its assumptions.</p>
+          <p className="md:col-span-4 meta normal-case tracking-normal !text-[0.85rem] leading-relaxed">The models run in the browser on synthetic data. They are teaching aids, not benchmarks.</p>
         </div>
       </section>
     </>

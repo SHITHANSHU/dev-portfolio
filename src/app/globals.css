@@ -7,43 +7,44 @@
 @import "@fontsource/ibm-plex-sans/600.css";
 
 /* ── Design tokens ─────────────────────────────────────────────
-   Two themes: white (default) and night. One blue accent for emphasis,
+   Two themes: white (default) and night, on neutral greys. One muted
+   oxblood accent for emphasis (labs also use it for failure states),
    one teal reserved for labs/simulations so "this is a model" is
    always visually distinct. */
 :root {
   --paper: #ffffff;
-  --paper-2: #f6f7f9;
-  --paper-3: #eceef2;
-  --ink: #111318;
-  --ink-2: #3a3f4a;
-  --muted: #646a76;
-  --rule: #dcdfe5;
-  --rule-strong: #111318;
-  --signal: #1d4ed8;
-  --signal-soft: #dde7fb;
+  --paper-2: #f7f7f8;
+  --paper-3: #eeeef0;
+  --ink: #18181b;
+  --ink-2: #3f3f46;
+  --muted: #6b6b74;
+  --rule: #e2e2e6;
+  --rule-strong: #18181b;
+  --signal: #8b2635;
+  --signal-soft: #f5e4e7;
   --lab: #17605b;
   --lab-soft: #dcece8;
   --warn: #805400;
-  --focus: #1d4ed8;
-  --code-bg: #f4f5f7;
+  --focus: #8b2635;
+  --code-bg: #f6f6f7;
   color-scheme: light;
 }
 :root[data-theme="dark"] {
-  --paper: #0e1116;
-  --paper-2: #161a21;
-  --paper-3: #1f242d;
-  --ink: #e6e9ef;
-  --ink-2: #c3c8d2;
-  --muted: #8f96a3;
-  --rule: #2a303a;
-  --rule-strong: #e6e9ef;
-  --signal: #7aa2ff;
-  --signal-soft: #1a2440;
+  --paper: #111113;
+  --paper-2: #18181b;
+  --paper-3: #222226;
+  --ink: #ececee;
+  --ink-2: #c8c8cd;
+  --muted: #93939b;
+  --rule: #2c2c31;
+  --rule-strong: #ececee;
+  --signal: #e3949f;
+  --signal-soft: #3b1e24;
   --lab: #6fc0b7;
   --lab-soft: #172926;
   --warn: #e0b04a;
-  --focus: #7aa2ff;
-  --code-bg: #141820;
+  --focus: #e3949f;
+  --code-bg: #161618;
   color-scheme: dark;
 }
 
