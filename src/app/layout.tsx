@@ -14,12 +14,27 @@ export const metadata: Metadata = {
 };
 
 // Runs before paint to avoid a theme flash.
-const themeScript = `try{var t=localStorage.getItem("theme");var a=["light","white","dark","sage","clay"];if(!a.includes(t))t=matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light";document.documentElement.dataset.theme=t}catch(e){document.documentElement.dataset.theme="light"}`;
+// Tells search engines this site belongs to this person (name-search knowledge panel).
+const personLd = JSON.stringify({
+  "@context": "https://schema.org",
+  "@type": "Person",
+  name: site.name,
+  alternateName: "Shithanshu",
+  url: absoluteUrl("/"),
+  jobTitle: "Founding Engineer",
+  address: { "@type": "PostalAddress", addressLocality: "Bengaluru", addressCountry: "IN" },
+  sameAs: [site.linkedin, "https://github.com/SHITHANSHU"],
+});
+
+const themeScript = `try{var t=localStorage.getItem("theme");var a=["light","dark"];if(!a.includes(t))t=matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light";document.documentElement.dataset.theme=t}catch(e){document.documentElement.dataset.theme="light"}`;
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" suppressHydrationWarning>
-      <head><script dangerouslySetInnerHTML={{ __html: themeScript }} /></head>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: themeScript }} />
+        <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: personLd }} />
+      </head>
       <body>
         <a href="#main" className="sr-only focus:not-sr-only focus:fixed focus:left-2 focus:top-2 focus:z-50 focus:bg-ink focus:text-paper focus:px-3 focus:py-2">Skip to content</a>
         <Header />

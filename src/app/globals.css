@@ -7,98 +7,44 @@
 @import "@fontsource/ibm-plex-sans/600.css";
 
 /* ── Design tokens ─────────────────────────────────────────────
-   Direction: a printed engineering monograph. Warm paper, ink, one
-   signal-red accent for emphasis, one instrument-teal reserved for
-   labs/simulations so "this is a model" is always visually distinct. */
+   Two themes: white (default) and night. One blue accent for emphasis,
+   one teal reserved for labs/simulations so "this is a model" is
+   always visually distinct. */
 :root {
-  --paper: #f3efe6;
-  --paper-2: #ebe6d9;
-  --paper-3: #e1dbca;
-  --ink: #1b1a17;
-  --ink-2: #3d3b35;
-  --muted: #6a665b;
-  --rule: #cdc6b3;
-  --rule-strong: #1b1a17;
-  --signal: #b3361a;
-  --signal-soft: #f0d9d1;
-  --lab: #1d5b57;
-  --lab-soft: #d6e4df;
-  --warn: #8a5a00;
-  --focus: #1d5b57;
-  --code-bg: #ece7da;
-  color-scheme: light;
-}
-:root[data-theme="dark"] {
-  --paper: #121311;
-  --paper-2: #1a1c19;
-  --paper-3: #232621;
-  --ink: #ebe8de;
-  --ink-2: #c9c6ba;
-  --muted: #9b978a;
-  --rule: #2f322c;
-  --rule-strong: #ebe8de;
-  --signal: #ec7152;
-  --signal-soft: #3a211a;
-  --lab: #6fc0b7;
-  --lab-soft: #172926;
-  --warn: #e0b04a;
-  --focus: #6fc0b7;
-  --code-bg: #181a17;
-  color-scheme: dark;
-}
-:root[data-theme="white"] {
   --paper: #ffffff;
-  --paper-2: #f5f5f3;
-  --paper-3: #e9e9e6;
-  --ink: #171715;
-  --ink-2: #3c3c38;
-  --muted: #686861;
-  --rule: #d6d6d0;
-  --rule-strong: #171715;
-  --signal: #ad351d;
-  --signal-soft: #f4ddd6;
+  --paper-2: #f6f7f9;
+  --paper-3: #eceef2;
+  --ink: #111318;
+  --ink-2: #3a3f4a;
+  --muted: #646a76;
+  --rule: #dcdfe5;
+  --rule-strong: #111318;
+  --signal: #1d4ed8;
+  --signal-soft: #dde7fb;
   --lab: #17605b;
   --lab-soft: #dcece8;
   --warn: #805400;
-  --focus: #17605b;
-  --code-bg: #f3f3f0;
+  --focus: #1d4ed8;
+  --code-bg: #f4f5f7;
   color-scheme: light;
 }
-:root[data-theme="sage"] {
-  --paper: #dcebdd;
-  --paper-2: #cfe1d0;
-  --paper-3: #bdd4bf;
-  --ink: #14271a;
-  --ink-2: #2d4934;
-  --muted: #4d6853;
-  --rule: #a9c1ab;
-  --rule-strong: #14271a;
-  --signal: #8f3d25;
-  --signal-soft: #efd4c8;
-  --lab: #205b3b;
-  --lab-soft: #c0dec6;
-  --warn: #75510b;
-  --focus: #205b3b;
-  --code-bg: #d3e5d5;
-  color-scheme: light;
-}
-:root[data-theme="clay"] {
-  --paper: #f3e8df;
-  --paper-2: #ead9cb;
-  --paper-3: #dfc9b8;
-  --ink: #281c18;
-  --ink-2: #4b352e;
-  --muted: #755f54;
-  --rule: #d0b9a8;
-  --rule-strong: #281c18;
-  --signal: #a43a27;
-  --signal-soft: #edd2c7;
-  --lab: #365f58;
-  --lab-soft: #d5e5dc;
-  --warn: #835000;
-  --focus: #365f58;
-  --code-bg: #eee0d4;
-  color-scheme: light;
+:root[data-theme="dark"] {
+  --paper: #0e1116;
+  --paper-2: #161a21;
+  --paper-3: #1f242d;
+  --ink: #e6e9ef;
+  --ink-2: #c3c8d2;
+  --muted: #8f96a3;
+  --rule: #2a303a;
+  --rule-strong: #e6e9ef;
+  --signal: #7aa2ff;
+  --signal-soft: #1a2440;
+  --lab: #6fc0b7;
+  --lab-soft: #172926;
+  --warn: #e0b04a;
+  --focus: #7aa2ff;
+  --code-bg: #141820;
+  color-scheme: dark;
 }
 
 @theme inline {

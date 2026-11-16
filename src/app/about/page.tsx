@@ -1,10 +1,9 @@
 import type { Metadata } from "next";
-import Link from "next/link";
 import { absoluteUrl, site } from "@/lib/site";
 
 export const metadata: Metadata = {
   title: "About",
-  description: "Shithanshu Mishra: backend and distributed-systems engineer. Career timeline, technical domains and working principles.",
+  description: "Shithanshu Mishra: backend and distributed-systems engineer. Experience, technical domains and education.",
   alternates: { canonical: absoluteUrl("/about/") },
 };
 
@@ -14,7 +13,7 @@ const roles = [
     org: "Beltech AI", place: "Bengaluru", span: "Apr 2021 – present",
     positions: [
       {
-        title: "Senior Software Engineer — Founding Engineer", span: "Mar 2024 – present",
+        title: "Founding Engineer", span: "Mar 2024 – present",
         points: [
           "Led end-to-end backend architecture for a multi-tenant AI platform serving smart-city and government clients, owning data modelling, API design, deployment and production operations across Python and Java services.",
           "Designed a payment-grade financial platform: immutable ACID ledger, low-latency state management, prepaid wallets and automated reconciliation.",
@@ -52,12 +51,12 @@ const domains: [string, string][] = [
 
 export default function Page() {
   return (
-    <div className="wrap pt-14">
+    <div className="wrap pt-14 pb-16">
       <header className="grid gap-4 md:grid-cols-12 mb-14">
         <p className="section-no md:col-span-2">§ About</p>
         <div className="md:col-span-9">
-          <h1 className="font-serif text-5xl md:text-6xl font-medium tracking-tight leading-[1.02]">Greenfield systems, taken to commercial-grade production.</h1>
-          <p className="mt-6 max-w-2xl font-serif text-xl leading-snug text-ink-2">Backend engineer with five-plus years designing and operating multi-tenant distributed systems, from real-time streaming and WebSocket infrastructure to transactional platforms. Founding engineer with full-stack ownership across data modelling, API design, workflow orchestration, observability and production operations. Based in {site.location}.</p>
+          <h1 className="font-serif text-5xl md:text-6xl font-medium tracking-tight leading-[1.02]">{site.name}</h1>
+          <p className="mt-6 max-w-2xl font-serif text-xl leading-snug text-ink-2">Senior engineer with over five years of experience designing and operating multi-tenant distributed systems, including real-time streaming, WebSocket infrastructure and transactional platforms. Founding Engineer at Beltech AI, responsible for data modelling, API design, workflow orchestration, observability and production operations. Based in {site.location}.</p>
         </div>
       </header>
 
@@ -92,21 +91,10 @@ export default function Page() {
         </dl>
       </section>
 
-      <section aria-labelledby="lead" className="mt-16 grid gap-x-12 gap-y-6 border-t-2 border-ink pt-4 md:grid-cols-12">
-        <h2 id="lead" className="meta md:col-span-2">Working principles</h2>
-        <div className="md:col-span-10 max-w-2xl space-y-5 text-[1.08rem]">
-          <p>Decisions are written down before code is, as RFCs, so they can be argued with. Reliability is designed in at the data-model and failure-handling level, not added after launch.</p>
-          <p>Prototypes become production under real latency and availability targets, which is why the journal here leans on failure modes, back-pressure and recovery rather than happy paths.</p>
-          <p>Work with government stakeholders has meant translating distributed-systems trade-offs for non-technical audiences, including live demonstrations to senior officials, and handling the contractual and compliance side of delivery.</p>
-        </div>
-      </section>
-
       <section aria-labelledby="edu" className="mt-16 grid gap-x-12 gap-y-6 border-t-2 border-ink pt-4 md:grid-cols-12">
         <h2 id="edu" className="meta md:col-span-2">Education</h2>
-        <p className="md:col-span-10">Bachelor of Engineering, Computer Science — Pune University, 2016–2020. CGPA 9.31/10.</p>
+        <p className="md:col-span-10">Bachelor of Engineering, Computer Science, Pune University, 2016–2020. CGPA 9.31/10.</p>
       </section>
-
-      <p className="mt-16 font-serif text-xl">See the <Link className="link" href="/projects/">projects</Link> and the <Link className="link" href="/journal/">journal</Link>, or <Link className="link" href="/contact/">get in touch</Link>.</p>
     </div>
   );
 }

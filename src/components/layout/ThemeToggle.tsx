@@ -2,11 +2,8 @@
 import { useSyncExternalStore } from "react";
 
 const themes = [
-  { id: "light", label: "Paper" },
-  { id: "white", label: "White" },
+  { id: "light", label: "White" },
   { id: "dark", label: "Night" },
-  { id: "sage", label: "Sage" },
-  { id: "clay", label: "Clay" },
 ] as const;
 type Theme = (typeof themes)[number]["id"];
 

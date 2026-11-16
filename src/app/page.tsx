@@ -14,9 +14,9 @@ export default function Home() {
           <div className="md:col-span-8">
             <p className="meta">{site.name} · {site.location}</p>
             <h1 className="mt-5 font-serif text-[2.7rem] leading-[1.02] font-medium tracking-tight md:text-[5.2rem] [text-wrap:balance]">
-              Distributed systems, streaming pipelines and video infrastructure, <em className="text-signal not-italic">tested</em> on the page.
+              Backend engineer building distributed systems, streaming pipelines and video infrastructure.
             </h1>
-            <p className="mt-8 max-w-xl text-xl leading-snug text-ink-2">Backend engineer working on multi-tenant platforms, real-time data and camera analytics. This is where the reasoning gets written down, with calculators and simulators you can break.</p>
+            <p className="mt-8 max-w-xl text-xl leading-snug text-ink-2">Founding Engineer at Beltech AI, working on multi-tenant platforms, real-time data and camera analytics. I write here about system design and the trade-offs behind it.</p>
             <p className="mt-8 flex flex-wrap gap-x-6 gap-y-2 font-sans text-sm font-medium">
               <Link className="link" href="/journal/">Read the journal →</Link>
               <Link className="link" href="/projects/">Projects →</Link>
@@ -26,7 +26,7 @@ export default function Home() {
           <aside className="md:col-span-4 md:border-l md:border-rule md:pl-8 font-sans text-sm self-end" aria-label="At a glance">
             <p className="meta mb-3">At a glance</p>
             <dl className="divide-y divide-rule border-y border-rule">
-              {[["Now", "Senior Software Engineer, Founding Engineer — Beltech AI"], ["Since", "April 2021 (promoted March 2024)"], ["Works in", "Kafka · MQTT · ksqlDB · Debezium · PostgreSQL · Spring Boot · Python"], ["Domain", "Smart-city platforms, VMS for large camera fleets, ledgers and workflows"]].map(([k, v]) => (
+              {[["Now", "Founding Engineer, Beltech AI"], ["Since", "April 2021"], ["Works in", "Kafka · MQTT · ksqlDB · Debezium · PostgreSQL · Spring Boot · Python"], ["Domain", "Smart-city platforms, VMS for large camera fleets, ledgers and workflows"]].map(([k, v]) => (
                 <div key={k} className="grid grid-cols-[4.5rem_1fr] gap-3 py-2.5"><dt className="meta pt-0.5">{k}</dt><dd>{v}</dd></div>
               ))}
             </dl>
@@ -78,8 +78,8 @@ export default function Home() {
       <section aria-labelledby="labs" className="border-t-2 border-ink">
         <div className="wrap grid gap-x-10 gap-y-4 py-12 md:grid-cols-12">
           <h2 id="labs" className="meta md:col-span-2 pt-2">Interactive labs</h2>
-          <p className="md:col-span-6 font-serif text-2xl leading-snug">Capacity calculators, partition explorers, an MQTT QoS playground, a GOP visualiser. Every one is a simplified model with its assumptions shown, built into the articles above.</p>
-          <p className="md:col-span-4 meta normal-case tracking-normal !text-[0.85rem] leading-relaxed">Synthetic data only. Nothing here connects to a real broker, database or camera, and none of the numbers are benchmark results.</p>
+          <p className="md:col-span-6 font-serif text-2xl leading-snug">Articles include interactive models: capacity calculators, partition explorers, an MQTT QoS playground and a GOP visualiser. Each one states its assumptions.</p>
+          <p className="md:col-span-4 meta normal-case tracking-normal !text-[0.85rem] leading-relaxed">All data is synthetic. The models do not connect to real systems, and their output is not benchmark data.</p>
         </div>
       </section>
     </>

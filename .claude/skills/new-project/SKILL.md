@@ -95,7 +95,7 @@ The goal: a reader can buy the parts and build the same device from this page al
 ### Images
 
 - SVG illustrations go in `public/projects/<slug>/`, referenced as `![alt text](/projects/<slug>/<name>.svg)` inside `<Figure label="Fig. N" caption="... Illustration, not a photo.">`. The `img` mapping adds the deploy basePath.
-- Draw SVGs by hand: `viewBox` set, light plate background (`#fbf9f4`), ink `#1b1a17`, accent `#b3361a`, teal `#1d5b57`, system sans/mono fonts, labels ≥ 11px at 720px wide, every wire labelled with its signal name. No external fonts or images inside the SVG.
+- Draw SVGs by hand: `viewBox` set, light plate background (`#fbf9f4`), ink `#1b1a17`, accent `#1d4ed8`, teal `#1d5b57`, system sans/mono fonts, labels ≥ 11px at 720px wide, every wire labelled with its signal name. No external fonts or images inside the SVG.
 - `<PhotoSlot caption="..." />` marks where a real photo should go. Replace with a real image when the owner provides one.
 
 ### Writing rules
