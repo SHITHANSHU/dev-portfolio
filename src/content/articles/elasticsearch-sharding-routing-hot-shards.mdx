@@ -1,0 +1,519 @@
+---
+title: "Elasticsearch Sharding in Practice: Shard Sizing, Custom Routing, Hot Shards and Zero-Downtime Reindexing"
+description: "Shard count arithmetic for Elasticsearch, how document routing works and when custom routing creates hot shards, rollover with ILM, and reindexing behind aliases with no downtime, with sizing and routing playgrounds."
+date: "2026-11-17"
+status: "published"
+category: "Search Systems"
+tags: ["Elasticsearch", "Sharding", "Capacity Planning", "ILM", "Distributed Systems"]
+featured: false
+series: "Article 08"
+related: ["cdc-mysql-debezium-kafka-elasticsearch", "kafka-partitions-replication-consumers"]
+---
+
+## The four ways a shard count goes wrong
+
+Consider a multi-tenant search and log cluster that started as one index created with whatever shard count someone typed, or the default of one. A year later it has four problems, and each one is a shard count decision made once and never revisited.
+
+- **One giant index.** 900 GB in five primaries: 180 GB shards that are slow to recover or relocate, with indexing confined to the nodes holding those five primaries and their replicas.
+- **Thousands of tiny shards.** Daily five-primary indices for a source that writes a gigabyte a day.
+- **One hot shard.** Documents routed by `tenant_id`, one tenant ten times the median, and the node holding its shard rejects bulk writes while its neighbours idle.
+- **A mapping change nobody can apply.** A field needs a different type, which means a new index, and nobody has written down how to build one without an outage.
+
+This is a composite scenario, not a story from a specific system. What follows is my capacity model and operating playbook for those four problems.
+
+I describe Elasticsearch 8.x. I believe the mechanisms are unchanged in 9.x, but verify defaults for your version; every default below is an 8.x default even where I do not repeat it. OpenSearch shares the concepts, with Index State Management in place of ILM. Elastic Cloud Serverless hides shards and is out of scope. I have worked with Elasticsearch as the serving index of a CDC pipeline, which is where my habit of versioned indices behind aliases comes from (see the [CDC article](/journal/cdc-mysql-debezium-kafka-elasticsearch/)); I include no benchmarks, cluster sizes or production figures. Every number here is a documented default or arithmetic labelled illustrative.
+
+## What a shard costs
+
+A shard is a complete Lucene index. That has consequences that a bare "more shards means more parallelism" intuition hides.
+
+- **Fixed overhead per shard.** Each shard has its own segments, open files, caches and a cluster state entry the master maintains and publishes. The old shards-per-GB-of-heap rule of thumb was retired in 8.x in favour of guidance based on mapped fields per node; I quote no per-field figure, so check the sizing documentation for your version.
+- **Per-shard work on every search.** A search runs a query task on one copy of every shard it targets, so a hundred shards means a hundred tasks plus a merge, and latency is bounded below by the slowest shard.
+- **Replicas repeat the work.** Elasticsearch replicates operations, not segment files: a replica re-indexes each document, costing CPU as well as disk. With one replica, indexing work roughly doubles.
+- **Recovery moves whole shards.** When a node is lost or the cluster rebalances, shards are copied. Recovery time scales with shard size, so a large shard is also a long window with reduced redundancy, during which one more failure can turn yellow into red. By default in 8.x the master waits one minute (`index.unassigned.node_left.delayed_timeout`) after a node leaves before rebuilding replicas elsewhere.
+
+<Figure label="Fig 1" caption="Write path for one document. The coordinating node picks the shard from the routing value, the primary indexes, replicas repeat the operation, and the acknowledgement follows the in-sync copies.">
+
+<FlowDiagram
+  title="Write path for one document"
+  steps={[
+    {label:"Bulk request", sub:"sent to any node"},
+    {label:"Coordinating node", sub:"hash of routing, mod primaries"},
+    {label:"Primary shard", sub:"index + translog", tone:"store"},
+    {label:"Replica shards", sub:"same operation, in-sync copies", tone:"store"},
+    {label:"Ack", sub:"after replicas respond"}
+  ]}
+/>
+
+</Figure>
+
+Step two is simplified; the exact formula is in the routing section.
+
+<Figure label="Fig 2" caption="Search path. Query phase hits one copy of every targeted shard; with routing it hits only the shards the routing value maps to.">
+
+<FlowDiagram
+  title="Search path"
+  steps={[
+    {label:"Search request", sub:"alias or index pattern"},
+    {label:"Coordinating node", sub:"resolve alias, indices, shards"},
+    {label:"Query phase", sub:"one copy of every targeted shard", tone:"warn"},
+    {label:"Fetch phase", sub:"only shards holding top hits"},
+    {label:"Merge + respond"}
+  ]}
+/>
+
+</Figure>
+
+Without routing the query phase touches every shard of every index the alias resolves to; with a `routing` value, one shard (or `routing_partition_size` shards). That difference is what makes custom routing attractive and dangerous.
+
+## Shard count arithmetic
+
+### Size targets
+
+Elastic's sizing guidance for time series data is primary shards of roughly 10 to 50 GB and no more than about 200 million documents each. Treat the band as a guide. The hard limit underneath is Lucene's cap of about 2^31 documents per shard (2,147,483,519); recovery time and search latency bite long before that.
+
+`number_of_shards` is fixed when the index is created (the default has been one since 7.0). `number_of_replicas` is dynamic (default one). The asymmetry is the root of this whole topic: you commit to a primary count before you know the data volume, and changing it later costs a split, a shrink or a reindex.
+
+### The formulas
+
+Symbols, with decimal units (1 GB is 10^9 bytes): `D` primary GB ingested per day, `T` retention in days, `R` replicas, `S_target` target primary shard size in GB, `P` primaries per rollover index, `N` data nodes, `disk` usable GB per node, `Q` searches per second.
+
+- Stored data: `D × T` GB of primaries, `D × T × (1 + R)` GB with replicas.
+- Rollover period when rolling by primary shard size: `S_target × P / D` days, capped by `max_age`.
+- Indices retained: `ceil(T / rolloverDays)`. Total shards: `indices × P × (1 + R)`.
+- Shards per node: `totalShards / N`. By default in 8.x `cluster.max_shards_per_node` is 1,000 and counts open shards, replicas included, on non-frozen nodes. It is enforced as a cluster total (the setting times the number of non-frozen data nodes), so uneven placement does not trip it. At the total, creating an index fails, and so does a rollover, because it creates one.
+- Disk utilisation: `D × T × (1 + R) / (N × disk)`. Nodes needed to stay under the low watermark: `ceil(D × T × (1 + R) / (disk × 0.85))`.
+- Shard requests per second: `Q × shards queried per search`.
+
+### A worked example (illustrative arithmetic)
+
+Take `D = 200 GB/day`, `T = 30 days`, `R = 1`, `S_target = 40 GB`, `P = 6`, `N = 12` nodes with `disk = 2,000 GB` each.
+
+| Quantity | Calculation | Result |
+|---|---|---|
+| Stored primaries | 200 × 30 | 6,000 GB |
+| Stored with replicas | 6,000 × 2 | 12,000 GB |
+| Disk used | 12,000 / (12 × 2,000) | 50% |
+| Rollover period | 40 × 6 / 200 | 1.2 days |
+| Indices retained | ceil(30 / 1.2) | 25 |
+| Total shards | 25 × 6 × 2 | 300 |
+| Shards per node | 300 / 12 | 25 |
+| Nodes for disk under 85% | ceil(12,000 / (2,000 × 0.85)) | 8 |
+
+Disk is half full because 12 nodes were chosen for write parallelism, not disk. The shard count is nowhere near 1,000 per node. And the shard size equals the target by construction, because rollover by size produces it.
+
+Now compare the layouts that produce the four problems at the start:
+
+- **Daily indices with five primaries**, same data: `30 × 5 × 2 = 300` shards of `200 / 5 = 40 GB`. Fine, but only because this source writes 200 GB a day.
+- **The same layout on a source that writes 1 GB a day:** also 300 shards, each `1 / 5 = 0.2 GB`, for 30 GB of primary data. This is the oversharding case: per-shard overhead dominates, and a search over the retention window fans out to 150 primaries holding 30 GB in total.
+- **One 6,000 GB index created with five primaries:** 1,200 GB shards. This is the undersharding case. No amount of node addition helps, because a shard is the unit of relocation.
+
+The arithmetic also gives the rule for the write path: the shard copies of the index currently being written, `P × (1 + R)`, should spread evenly over the nodes meant to take write load. Here that is 12 copies on 12 nodes, so each node does an equal share of indexing. With `P = 2` the same data would concentrate indexing on four nodes no matter how many you own.
+
+## How a document finds its shard
+
+Every document has a routing value, which defaults to its `_id`. The coordinating node maps it to a shard with a stable hash (murmur3). The documented formula is:
+
+```text
+# title: shard selection (documented formula, simplified names)
+routing_factor = num_routing_shards / num_primary_shards
+shard_num      = (hash(_routing) % num_routing_shards) / routing_factor
+```
+
+<Details summary="What num_routing_shards is and why it exists">
+
+`index.number_of_routing_shards` is an internal multiple of the primary count. Hashing against it, then dividing by the routing factor, lets `_split` multiply the primary count by an integer factor while every existing document stays on a consistent shard. Its default is derived from the primary count so that an index can usually be split by factors of two up to 1,024 shards; verify that for your version, and set it explicitly in a template if you plan to split.
+
+</Details>
+
+I write it as "hash of routing, mod primaries" in diagrams. That is exact only when `num_routing_shards` equals the primary count, which is not the default since 7.0; otherwise each shard owns a contiguous range of the hash modulo `num_routing_shards`. The mental model (a fixed hash, a fixed shard) holds either way.
+
+Two consequences follow.
+
+**The shard is a function of the primary count.** Change `number_of_shards` and almost every document maps elsewhere. This is the same property that makes changing a Kafka topic's partition count remap keys (see the [Kafka article](/journal/kafka-partitions-replication-consumers/)): the hash is stable, the modulus is not. Elasticsearch refuses to change the count in place for exactly this reason. `_split` and `_shrink` get away with it only because they move by integer factors that the routing factor accounts for.
+
+**`_id` uniqueness is per shard.** Elasticsearch does not check for the same `_id` on other shards. As long as routing defaults to `_id` this is invisible: one id, one shard. It becomes visible the moment custom routing enters.
+
+## Custom routing: co-location and routed search
+
+Custom routing means supplying a `routing` value on the request instead of letting `_id` decide. The standard use is tenant or user co-location: every document for tenant `acme` gets `routing=acme`, so they live on one shard, and a search for that tenant carries the same `routing` value and touches one shard instead of all of them.
+
+```http
+# title: indexing and searching with routing (illustrative)
+PUT /orders-v1/_doc/1001?routing=acme
+{ "tenant_id": "acme", "status": "paid", "total_cents": 12900 }
+
+GET /orders-v1/_search?routing=acme
+{ "query": { "term": { "tenant_id": "acme" } } }
+```
+
+The win is fan-out: with six primaries a routed search does one sixth of the shard-level work and its latency depends on one shard, not the slowest of six. The costs are the rest of this section and the hot-shard problem after it.
+
+### The duplicate-id trap
+
+Because `_id` uniqueness is per shard, the same `_id` with two routing values can produce two documents. The usual accident is an indexer that sets `routing` plus a path (update script, manual fix, another client) that omits it: the document lands by its `_id` hash, a routed `GET` misses it, and the index holds duplicates.
+
+The defence is to make the mapping refuse unrouted writes:
+
+```http
+# title: require routing on every write (illustrative)
+PUT /orders-v1
+{
+  "settings": { "number_of_shards": 6 },
+  "mappings": {
+    "_routing": { "required": true },
+    "properties": { "tenant_id": { "type": "keyword" } }
+  }
+}
+```
+
+With `_routing.required` set, an index, update or delete without a routing value is rejected instead of silently misplaced.
+
+### Filtered aliases that carry the routing
+
+A routed search is easy to forget. A per-tenant alias carries the filter and the routing for you:
+
+```http
+# title: per-tenant alias with filter and routing (illustrative)
+POST /_aliases
+{
+  "actions": [
+    { "add": { "index": "orders-v1", "alias": "orders-acme",
+               "filter": { "term": { "tenant_id": "acme" } },
+               "routing": "acme" } }
+  ]
+}
+```
+
+Searching `orders-acme` applies the filter and routes to one shard. It is a convenience, not a security boundary (see below).
+
+### Routing partitions
+
+The alternative to one shard per tenant is `index.routing_partition_size`. A tenant's documents are spread over a subset of `p` shards, chosen by the document `_id`. The documented formula adds an `_id`-derived offset:
+
+```text
+# title: shard selection with a routing partition (documented formula)
+routing_value = hash(_routing) + hash(_id) % routing_partition_size
+shard_num     = (routing_value % num_routing_shards) / routing_factor
+```
+
+The setting must be greater than one and smaller than `number_of_shards`, and the documentation requires `_routing.required: true` with it and disallows join fields; check the constraints for your version. A routed search now touches `p` shards instead of one: the tenant's write load is divided by about `p` and its search cost multiplied by `p`.
+
+## The hot-shard problem
+
+A shard is hot when the node holding it does disproportionately more work than its peers. There are three distinct causes, and they need different fixes.
+
+### Skewed routing keys
+
+With tenant routing, a shard's load is the sum of the sizes of the tenants hashed to it. If tenant sizes follow a power-law shape, which is the common case, the biggest tenant sets the busiest shard. Adding primaries does not help that tenant at all: its documents still map to one shard. The horizontal limit is built in: one routing value can use one shard's worth of one node's write capacity.
+
+The symptom is a write rejection. When a node's write thread pool queue fills, or its indexing pressure limit (`indexing_pressure.memory.limit`) is exceeded, Elasticsearch rejects work with HTTP 429 and `es_rejected_execution_exception`. For a `_bulk` request the response is usually 200 with a per-item error, so a client that checks only the status code believes the batch succeeded. Rejected items are not indexed, so the indexer has to parse the bulk response and retry only the 429 items with backoff. If rejections persist across retries, more clients will not fix it.
+
+### Write-hot newest index
+
+In time-based layouts every write goes to the current index. If that index has two primaries on two nodes, those two nodes take all the indexing work for a 12-node cluster, regardless of how well-balanced the old indices are. The fix is in the template: the write index needs enough primaries, replicas included, to cover the nodes meant to take writes, and `index.routing.allocation.total_shards_per_node` caps how many shards of one index, primaries and replicas counted together, a node may hold, so the write index cannot pile up on a few nodes. It does not distinguish primaries from replicas, and it is a hard limit: leave headroom for a lost node, or its shards stay unassigned.
+
+### Allocation-hot and read-hot shards
+
+The allocator balances mainly shard counts; in later 8.x releases it also weighs disk usage and, for data streams with a write-load forecast (licence-dependent), write load. It cannot know which tenant's shard will be busy, so two busy shards can still share a node. On the read side, a shard holding an expensive tenant makes every search that includes it wait. Adaptive replica selection (on by default since 7.0) steers requests to the faster copy, so replicas relieve read hotness, and routed searches avoid the slow shard for other tenants.
+
+### Detecting it
+
+Compare per-shard and per-node numbers, not cluster averages:
+
+- `GET _cat/shards?v&s=store:desc` for shard sizes and which node holds them.
+- `GET _cat/allocation?v` for shards and disk per node.
+- `GET _cat/thread_pool/write?v&h=node_name,active,queue,rejected` for rejections per node.
+- `GET _nodes/stats/indices/indexing` for per-node indexing counts, and `GET <index>/_stats/indexing?level=shards` for per-shard counts; compute max divided by mean.
+- `GET _nodes/stats/indexing_pressure` for 429s that the thread pool view does not show.
+
+A ratio near 1 is balanced; one that stays well above 1 is a skew finding.
+
+### Fixes, in the order I reach for them
+
+1. **Route by `_id`** when you never need co-location. It removes the skew at the cost of full fan-out.
+2. **Add `routing_partition_size`** when co-location is a performance feature, not a requirement.
+3. **Move big tenants to their own index.** One shared routed index for the long tail, a dedicated index (own shard count and rollover) per large tenant, behind per-tenant aliases.
+4. **Cap shards per node and raise primaries** for the write index.
+5. **Add replicas** for read hotness only; they add to write cost.
+
+The lab below puts the first three side by side: 24 synthetic documents per tick from 12 tenants of Zipf-shaped sizes, onto three nodes.
+
+Try this: at the defaults (tenant routing, skew 1.2) press Step a few times and watch which shard bar grows fastest and which node starts marking rejections with ×. Switch to `_id` routing, press Rewind and Play, then try partitions and move the partition size. Finally drop node write capacity.
+
+<RoutingSkewPlayground />
+
+At the lab's defaults, tenant routing ends the 40 ticks with the busiest shard at 2.46 times the mean load and 167 of the 960 documents rejected, because the biggest tenant's shard sits on one node whose write capacity is ten documents per tick. `_id` routing sits at 1.04 and rejects nothing at the same capacity. Partitions of three land in between: 1.24 times the mean with 24 rejections, at the price that a search for the biggest tenant now touches three shards instead of one. The unrouted search touches all of them in every mode. Those figures are the lab's synthetic arithmetic, not a measurement of Elasticsearch.
+
+## Rollover with ILM instead of guessing forever
+
+The undersharded and oversharded cases share a cause: a fixed index meant to absorb an unknown amount of data. Rollover removes the guess. Writes go to the current index; when it meets a condition a new index is created from a template and takes over. The shard count then applies per generation, and you can change it for the next index without touching the old ones.
+
+There are two ways to arrange this.
+
+- **A write alias.** You bootstrap `app-logs-000001` with `is_write_index: true` on an alias, and rollover moves that flag to the next index. Exactly one index may be the write index for the alias.
+- **A data stream.** The stream manages backing indices (named like `.ds-<name>-<date>-<generation>`) and the write index for you. Data streams are append-only: you cannot update or delete a document by id through the stream, only by query or by addressing a backing index directly. They fit logs and metrics. Entity data that gets updated usually wants the alias form.
+
+<Figure label="Fig 3" caption="Rollover lifecycle. Conditions are checked on a poll interval, so an index can overshoot its threshold before it rolls.">
+
+<FlowDiagram
+  title="Rollover lifecycle"
+  steps={[
+    {label:"Write alias or data stream"},
+    {label:"app-logs-000007", sub:"hot, write index", tone:"store"},
+    {label:"Rollover condition", sub:"50 GB primary shard or 30 d", tone:"warn"},
+    {label:"app-logs-000008", sub:"becomes write index"},
+    {label:"Warm", sub:"shrink, force merge"},
+    {label:"Delete", sub:"after retention"}
+  ]}
+/>
+
+</Figure>
+
+### Conditions and what the defaults mean
+
+The ILM rollover action supports `max_age`, `max_docs`, `max_size`, `max_primary_shard_size` and `max_primary_shard_docs`, with `min_*` variants in newer 8.x releases. `max_primary_shard_size` maps to the sizing arithmetic: rolling when the largest primary reaches the target makes shard size a property of the policy, not of the traffic. Elastic's built-in policies for data streams use 50 GB for the primary shard size and 30 days for the age in 8.x; confirm those in your version.
+
+Two operational details matter more than the thresholds.
+
+- **Rollover is checked on a poll interval.** `indices.lifecycle.poll_interval` is ten minutes by default, so an index overshoots its condition by whatever it ingests in up to ten minutes. At high write rates set the shard size target below the pain threshold, not at it.
+- **Empty indices.** In recent 8.x releases rollover skips an empty write index, so a quiet source does not produce a stream of empty indices on `max_age`. Verify the behaviour on your version before relying on it for low-volume sources.
+
+### An illustrative policy
+
+```http
+# title: ILM policy (illustrative, not validated against a specific version)
+PUT /_ilm/policy/logs-policy
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "actions": {
+          "rollover": { "max_primary_shard_size": "40gb", "max_age": "30d" }
+        }
+      },
+      "warm": {
+        "min_age": "2d",
+        "actions": { "shrink": { "max_primary_shard_size": "50gb" }, "forcemerge": { "max_num_segments": 1 } }
+      },
+      "delete": { "min_age": "30d", "actions": { "delete": {} } }
+    }
+  }
+}
+```
+
+`min_age` is measured from rollover when the policy has a rollover action, not from index creation, so a `delete` at 30 days keeps data for 30 days after each index rolled. Shrinking in the warm phase is the sizing logic applied late: write with `P` primaries for parallelism, then compact when the index is read-only and no longer needs it. I shrink by `max_primary_shard_size`, not to a fixed count: six 40 GB primaries shrunk to one would be a 240 GB shard, so the shrink pays off only for indices that rolled on age while small. Shrink needs a copy of every shard on one node, which ILM arranges. Searchable snapshots and the frozen tier extend the lifecycle; I leave them out.
+
+The template that applies to every new generation is where the shard count lives:
+
+```http
+# title: composable template for the rollover indices (illustrative)
+PUT /_index_template/logs-template
+{
+  "index_patterns": ["app-logs-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 6,
+      "number_of_replicas": 1,
+      "index.lifecycle.name": "logs-policy",
+      "index.lifecycle.rollover_alias": "app-logs-write",
+      "index.routing.allocation.total_shards_per_node": 2
+    }
+  }
+}
+```
+
+A quiet failure mode lives here. If someone edits `number_of_shards` in the template, generations differ from the next rollover on. Each index stays self-consistent, so nothing errors; what breaks is any assumption that a tenant lands on the same shard number across indices, and your dashboard arithmetic. Treat template shard counts as reviewed configuration.
+
+## Capacity model: where the bottleneck moves
+
+Shard design is capacity planning: you are choosing what runs out first. As data and load grow, the binding constraint moves along a predictable path.
+
+1. **A few large shards.** Recovery and relocation take long, a single shard's search latency is the floor for every query, and write load cannot spread past the primary count.
+2. **Many tiny shards.** Cluster state grows, master work grows, every search spawns more tasks, and `cluster.max_shards_per_node` eventually blocks index creation.
+3. **Skewed routing.** One node's write thread pool and disk fill first while the cluster average looks healthy.
+4. **Disk watermarks.** By default in 8.x at 85% used a node stops receiving shards (primaries of brand-new indices excepted), at 90% shards are moved off it, and at 95% (flood stage) indices with a shard on it become read-only with `index.blocks.read_only_allow_delete`. The block is lifted automatically once usage drops below the high watermark (since 7.4), but writes fail until then. Recent 8.x releases also cap the free space each watermark demands on large disks (`max_headroom`), so big nodes cross the thresholds above these percentages.
+5. **At very large scale,** cluster state size and total mapped fields.
+
+The horizontal limits are the part that adding nodes does not fix:
+
+- A shard is the unit of write parallelism for its documents. A routing value maps to one shard (or `p` shards with a partition), so one huge tenant cannot use more than that many shards' worth of node capacity.
+- A search is as slow as the slowest shard it queries.
+- `number_of_shards` is fixed per index. For rollover that is fine; for a single index it is a commitment.
+- Pick `P` with the node count: `P × (1 + R)` copies of the write index should divide evenly across the nodes meant to take writes.
+
+The worked example gave the shape: 300 shards on 12 nodes (25 each) against a 1,000 limit, 50% disk, and a last-day search touching six shards. The calculator lets you move every input. With a full-retention search over 25 indices of 6 primaries, the same 50 searches per second are 7,500 shard-level requests per second. That is an upper bound: for a time-bounded query, the can-match pre-filter phase can skip shards that hold no matching timestamps.
+
+Try this: switch the layout to daily indices and set ingest to 1 GB per day to see the oversharding case (300 shards for 30 GB of data). Set ingest back to 200 with 2 primaries for the undersharded case. Reduce the node count until disk passes the 85% line, and flip "Search covers" to full retention to watch the shard request rate jump.
+
+<ShardSizingCalculator />
+
+What you should have seen: the first limit that bites depends on the layout, not on data volume alone. Rollover by size keeps shards inside the band at any ingest rate and moves the problem to node count and disk. Daily indices tie shard size to ingest, so the same template is right at 200 GB a day and wasteful at 1 GB a day. All of it is arithmetic on the inputs.
+
+## Changing shard count and mappings without downtime
+
+Three tools change an existing index.
+
+| Tool | Changes | Requirements | When |
+|---|---|---|---|
+| `_split` | Primary count, multiplied by an integer factor | Source read-only (`index.blocks.write`), a splittable `number_of_routing_shards` | You need more primaries and the data can stop changing |
+| `_shrink` | Primary count, reduced by a factor | Source read-only, a copy of every shard on one node | Compacting an index that no longer takes writes |
+| `_reindex` | Anything: mappings, analyzers, arbitrary shard count | A second index with room for the data | Mapping changes or when the index must stay writable |
+
+Field types cannot be changed in place; additive mapping changes are allowed. Any other mapping change needs `_reindex`, and so does a shard count change on an index that must keep taking writes. Reindexing behind an alias is therefore the general solution, and it is the CDC article's rebuild pattern applied to a plain index.
+
+### The procedure
+
+<Figure label="Fig 4" caption="Reindex behind an alias. Clients only know the alias; v2 is built and verified before the swap, and the swap itself is one atomic request.">
+
+<SequenceDiagram
+  title="Zero-downtime reindex behind an alias"
+  actors={["Indexer", "Alias", "orders-v1", "orders-v2"]}
+  messages={[
+    {from:"Indexer", to:"orders-v2", label:"PUT v2: new mapping, refresh off, replicas 0"},
+    {from:"Indexer", to:"orders-v2", label:"_reindex from v1, slices auto", note:"record T0 just before; snapshot of v1"},
+    {from:"Indexer", to:"Alias", label:"writes continue to v1", note:"v2 misses writes after T0"},
+    {from:"Indexer", to:"orders-v2", label:"catch-up: updated_at at or after T0", note:"repeat until the delta is small"},
+    {from:"Indexer", to:"orders-v2", label:"restore refresh + replicas, wait green"},
+    {from:"Indexer", to:"Alias", label:"POST _aliases: remove v1, add v2", note:"atomic"},
+    {from:"Indexer", to:"orders-v2", label:"final catch-up from last pass", note:"safe only with comparable versions"},
+    {from:"Indexer", to:"orders-v1", label:"keep for rollback, then delete", dashed:true}
+  ]}
+/>
+
+</Figure>
+
+**1. Create v2 tuned for a bulk load.** New mapping, the shard count you want, replicas and refresh off while loading (the documented indexing-speed advice), both restored before the swap.
+
+```http
+# title: create the new index (illustrative)
+PUT /orders-v2
+{
+  "settings": { "number_of_shards": 12, "number_of_replicas": 0, "refresh_interval": "-1" },
+  "mappings": { "properties": {
+    "tenant_id": { "type": "keyword" },
+    "total_cents": { "type": "long" },
+    "updated_at": { "type": "date" }
+  } }
+}
+```
+
+**2. Copy the data as a background task.** `_reindex` reads a snapshot of the source taken when it starts, supports `slices` and `requests_per_second`, and returns a task id with `wait_for_completion=false`. `version_type: external` carries the source version across so a later pass cannot overwrite a newer document in v2 with an older one.
+
+```http
+# title: reindex as a task (illustrative)
+POST /_reindex?wait_for_completion=false&slices=auto
+{
+  "source": { "index": "orders-v1" },
+  "dest":   { "index": "orders-v2", "version_type": "external" }
+}
+
+GET /_tasks/<task_id>
+```
+
+Record the start time as `T0` before this call. Writes keep going to `orders-v1` through the alias, so when the copy finishes v2 is missing everything written since `T0`.
+
+**3. Catch up by `updated_at`.** Copy documents changed since `T0`, with a small overlap for clock skew. With external versions, re-copying a document v2 already holds at the same version is a version conflict, and a conflict aborts `_reindex` by default, so every catch-up pass sets `conflicts: proceed`.
+
+```http
+# title: catch-up pass (illustrative)
+POST /_reindex?wait_for_completion=true
+{
+  "conflicts": "proceed",
+  "source": { "index": "orders-v1",
+              "query": { "range": { "updated_at": { "gte": "2026-11-17T10:00:00Z" } } } },
+  "dest":   { "index": "orders-v2", "version_type": "external" }
+}
+```
+
+Repeat, advancing the timestamp, until a pass is short. This works only if every writer sets `updated_at`; verify that, do not assume it.
+
+**4. Restore settings, wait for green, verify.** Restoring is two calls: `PUT /orders-v2/_settings` with the real `refresh_interval` and `number_of_replicas`, then `GET /_cluster/health/orders-v2?wait_for_status=green`. Only then compare `_count` on both indices (with refresh off, v2's count shows only what was last refreshed), plus a sample or checksum comparison for anything you care about.
+
+**5. Swap the alias atomically.** Actions in one `_aliases` request apply as one change: there is no instant at which `orders` points at both indices or neither.
+
+```http
+# title: atomic alias swap (illustrative)
+POST /_aliases
+{
+  "actions": [
+    { "remove": { "index": "orders-v1", "alias": "orders" } },
+    { "add":    { "index": "orders-v2", "alias": "orders" } }
+  ]
+}
+```
+
+**6. Final catch-up, then keep v1 for rollback.** One last pass copies writes that reached v1 between the previous pass and the swap. But clients already write to v2, and internal versions in v1 and v2 count independently after the copy: a document updated twice in v1 before the swap and once in v2 after it has the higher version in v1, so the pass overwrites the newer write. A post-swap pass is safe only when every writer uses external versions from the source of truth; otherwise run the final pass inside a short write pause before the swap, as below. Rolling back is the same swap in reverse, once you copy back what v2 took meanwhile.
+
+### The two ways it goes wrong
+
+**Swapping before catch-up** loses every write after the snapshot; they exist only in v1. **The delete hole** is subtler. A query on `updated_at` cannot see a document that no longer exists, and the snapshot copy read the state at `T0`, so a document deleted in v1 after `T0` is still in v2 and returns in search results.
+
+There are three ways to close the hole, in rising order of effort:
+
+- **Pause writes briefly at the swap.** Queue writes at the client, run the last catch-up plus a reconciliation of deletes (by id comparison or soft-delete tombstones), swap, then release. Simplest correct approach; the pause is as long as the final catch-up.
+- **Dual-write** from the application. Correct only if the two writes cannot diverge on failure, which in practice means a log or outbox underneath.
+- **Replay from the source of truth.** With a CDC pipeline, point a second consumer at `orders-v2` and replay from a Kafka offset taken at `T0`, using external versioning so the replay cannot regress a newer document. The change log contains deletes, so nothing is hidden, provided an out-of-order replay does not outlast `index.gc_deletes` (the CDC article covers that window). I prefer this when the pipeline exists; the [CDC article](/journal/cdc-mysql-debezium-kafka-elasticsearch/) covers the versioning and rebuild.
+
+The lab models four strategies over 30 abstract ticks, with a snapshot of 400 documents, and counts what is left behind.
+
+Try this: at the defaults (10 writes and 2 deletes per tick, copy rate 60) step to the swap under "Swap right after copy" and read the stats. Switch to catch-up by `updated_at`, then to "Pause writes" and note the pause length, then "Replay change log". Finally set writes to 40 and copy rate to 30 under catch-up and see why it never swaps.
+
+<AliasReindexPlayground />
+
+What you should have seen: at the defaults, swapping immediately leaves 70 writes missing and 14 deleted documents alive in v2. Catch-up fixes the writes and still leaves the deletes. Pausing writes is consistent at the cost of a two-tick pause in this model; replaying the change log is consistent with no pause because deletes are in the log. Catch-up converges only when the copy rate exceeds the write rate. These counts are the lab's model, not measurements.
+
+## Failure modes and recovery
+
+| Failure | What happens | Real guarantee | Recovery |
+|---|---|---|---|
+| Node loss | Replicas of its primaries are promoted; cluster is yellow; replicas rebuilt after the delayed timeout | Acknowledged writes survive if an in-sync copy exists. With zero replicas those shards are red and data is gone until the node returns or a snapshot is restored | At least one replica; recovery time scales with shard size |
+| Oversized shards | Relocation and recovery copy whole shards | Correct, with a long window of reduced redundancy | Roll over by `max_primary_shard_size`; `_split` or reindex |
+| Too many small shards | Cluster state and master load grow; searches fan out; `cluster.max_shards_per_node` blocks index creation | Correct but expensive, then new indices fail | Rollover by size, not day; shrink; merge daily indices by reindex |
+| Hot write shard | One node saturates its write thread pool; bulk items rejected with 429 | Rejected items are not indexed; the client must retry | Retry 429 items; partition or split the big tenant; route by `_id` |
+| Disk watermark | Low stops new shards arriving; high moves shards away; flood stage makes indices read-only | Writes fail at flood stage | Free disk or add nodes; the block lifts below the high watermark |
+| Reindex lost writes | Alias swapped before catch-up | Writes after the snapshot exist only in v1 | Catch-up, pause or replay; compare counts before the swap |
+| Missing routing on a routed index | The document lands by `_id` hash; a routed `GET` misses it; duplicates become possible | `_id` uniqueness is per shard | `_routing.required: true` in the mapping |
+
+## Operations: metrics and alerts
+
+| Signal | Source | Alert when | Why |
+|---|---|---|---|
+| Largest primary shard vs target | `_cat/shards` | A shard is past the target band | Rollover is not firing or a single index is oversized |
+| Shards per node vs limit | `_cat/allocation`, cluster settings | Approaching the limit | Index creation fails abruptly at the limit |
+| Disk vs watermarks | `_cat/allocation` | Past the low watermark, well before flood stage | Allocation stops first, then writes |
+| Write rejections | `_cat/thread_pool/write` | Rejections rising on any node | First sign of a hot shard or undersized write capacity |
+| Per-shard indexing skew | `<index>/_stats/indexing?level=shards` | Max over mean persistently above your threshold | Routing skew shows here before it shows as rejections |
+| Search latency p99 and shard slow log | Application metrics, slow log | p99 drifts while the mean does not | A slow shard dominates the tail |
+| Unassigned shards | `_cluster/health`, `_cluster/allocation/explain` | Any unassigned shard that persists | Explain tells you whether it is disk, filters or a shard cap |
+| ILM errors | `GET <index>/_ilm/explain` | An index stuck in an error step | Rollover silently stops, and the write index grows |
+
+I give no universal thresholds: the right ratios depend on your tenant distribution and node capacity.
+
+## Security considerations
+
+- **Grant privileges on alias names, not backing indices,** so you can swap indices without re-issuing permissions.
+- **A filtered alias is not a security boundary.** A user with privileges on the underlying index can skip the filter. Enforce tenant isolation with privileges on the alias plus document-level security (depending on your licence) or separate indices per tenant.
+- **Derive the routing value from the authenticated context.** If the client supplies it, a caller can steer requests at another tenant's shard. Routing is a placement optimisation, not an access check.
+- **Reindex runs with the caller's privileges.** Give the operator role the minimum on source and destination, and allow remote sources only through the cluster setting (`reindex.remote.whitelist` in the versions I know; check the name in yours).
+
+## Choosing a sharding strategy
+
+| Workload | Index layout | Routing | Rollover | Shard count rule |
+|---|---|---|---|---|
+| Append-only logs and metrics | Data stream | None (default `_id`) | Size and age | `P × (1 + R)` covering the write nodes, shards 10 to 50 GB |
+| Many small tenants | One shared index per generation | Tenant routing, with `routing_partition_size` if some tenants are large | Size | Same as above, plus watch skew |
+| A few huge tenants | Index per large tenant, shared index for the tail | Routing only in the shared index | Per index | Size each index to its tenant's volume |
+| Entity search with updates, or frequent mapping changes | Versioned index behind an alias | Default, or entity id if co-location is needed | None | Size for steady state; rehearse the reindex, deletes included |
+
+## Assumptions and limitations
+
+<Callout type="assumption" title="Scope and assumptions">
+
+I describe Elasticsearch 8.x. I believe the mechanisms are unchanged in 9.x, but I could not check the official documentation while writing, so every default is stated as an 8.x default and should be verified against your version. Configuration and request examples are illustrative and not validated against a specific version. Capacity numbers are arithmetic on stated inputs, not benchmarks, and I give no indexing throughput or latency figures. Dense vector fields change the memory arithmetic and are not modelled. The labs simplify deliberately: constant ingest, even allocation and decimal gigabytes in the calculator; a stand-in hash, a routing factor of one, no replicas and no carried queue in the routing playground; counted documents, abstract ticks and a reindex that never fails in the reindex playground. Hot shards from expensive queries and uneven allocation are described but not simulated.
+
+</Callout>
+
+## Conclusion
+
+The shard count is a commitment made with the least information you will ever have, so make it cheap to revise: size by arithmetic, let rollover absorb the uncertainty, choose routing only when co-location earns its fan-out savings, and rehearse changing an index behind an alias, deletes included. The hot shard is the case where adding nodes does not help, because the limit is the routing key itself.
