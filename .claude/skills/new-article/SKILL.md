@@ -10,7 +10,7 @@ Input: `$ARGUMENTS` = topic plus key points. If the topic is missing, ask once. 
 
 The house style is the existing articles. Match them; do not invent a new format. Articles are written in first person singular ("I").
 
-Three stages, each on a set model. Stages hand off through files in `../.internal/articles/<slug>/` (outside the published repo):
+Three stages, each on a set model. Stages hand off through files in `<rules>/articles/<slug>/`, where `<rules>` is the private `blog-rules` checkout (see "Rules dir" in `CLAUDE.md`; locally `../blog-rules`). Commit and push each hand-off file to `blog-rules` when its stage writes it:
 
 | Stage | Model | Runs as | Output |
 | --- | --- | --- | --- |
@@ -26,12 +26,12 @@ Every agent prompt includes: the topic and key points, the path of this skill fi
 - `src/lib/content/schema.ts`: frontmatter contract.
 - `src/components/lab/LabShell.tsx`, `controls.tsx`, `registry.ts`, `cdc/usePlayer.ts`, `useReducedMotion.ts`.
 - One playground (`kafka/KafkaConsumerGroupPlayground.tsx`) and one calc module plus its test (`src/lib/calc/redis.ts`, `redis.test.ts`).
-- `../.internal/writer-brief.md` and `../.internal/lab-brief.md` if present: author facts and lab contract. `../agent.md` §9–10 and `../plan.md` §7–8 if present.
+- `<rules>/writer-brief.md` and `<rules>/lab-brief.md`: author facts and lab contract. `<rules>/agent.md` §9–10 and `<rules>/plan.md` §7–8. This skill wins where they differ.
 - `ls src/content/articles` for existing slugs, the next `series` number and `related` candidates.
 
 ## Stage 1: Technical planning (Opus)
 
-Write `../.internal/articles/<slug>/plan.md` covering:
+Write `<rules>/articles/<slug>/plan.md` covering:
 
 - **Problem and scope**: the concrete situation that makes the topic matter, who the reader is, what is in and out of scope, and the version(s) the article targets.
 - **Metadata**: slug (kebab-case), title, `series: "Article NN"` (next number), category, tags, 1–3 existing `related` slugs.
@@ -105,7 +105,7 @@ Then render it: `npm run dev`, open `/journal/<slug>/`, check desktop + 390px (`
 
 ## Stage 3: Independent review (Opus)
 
-A fresh Opus agent that did not write the article. It reads `plan.md`, the MDX, the calc modules, the lab components and their tests, and writes `../.internal/articles/<slug>/review.md`. It must:
+A fresh Opus agent that did not write the article. It reads `plan.md`, the MDX, the calc modules, the lab components and their tests, and writes `<rules>/articles/<slug>/review.md`. It must:
 
 - **Challenge technical explanations**: is each mechanism described correctly, for the stated version? Are guarantees overstated ("exactly once", "durable", "no data loss")?
 - **Find incorrect assumptions**: in prose, in calc functions, and in lab `assumptions[]`.
@@ -121,4 +121,4 @@ Then fix every `must-fix` (and `should-fix` where cheap): send the findings back
 
 ## Report
 
-≤15 lines: files created/changed, word count, labs (name, kind, what animates), check results with pass counts, review findings (fixed / left with reason), facts still unverified, anything skipped. Do not commit or push unless asked.
+≤15 lines: files created/changed, word count, labs (name, kind, what animates), check results with pass counts, review findings (fixed / left with reason), facts still unverified, anything skipped. Then publish as `CLAUDE.md` "Publishing" says (commit and push to `main`) once Verify passes, unless the user asked to hold it.

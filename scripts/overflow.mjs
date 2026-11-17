@@ -1,6 +1,6 @@
 // Reports elements wider than the viewport at 390px. Usage: node scripts/overflow.mjs <url>...
 import { chromium } from "playwright-core";
-const b = await chromium.launch({ executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" });
+const b = await chromium.launch({ executablePath: process.env.CHROME_PATH ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" });
 for (const url of process.argv.slice(2)) {
   const p = await b.newPage({ viewport: { width: 390, height: 844 } });
   await p.goto(url, { waitUntil: "networkidle" });

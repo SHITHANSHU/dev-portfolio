@@ -12,12 +12,14 @@ Projects are **technical case studies**, not journal articles. The journal (`/jo
 
 This skill is generate-only: there is no CMS, draft or publish state. The page goes live when the owner commits and pushes.
 
+`<rules>` is the private `blog-rules` checkout (see "Rules dir" in `CLAUDE.md`; locally `../blog-rules`). Commit and push `evidence.md` and `review.md` there when written. In a cloud session the project source is a GitHub repository: add it to the session and read it the same read-only way; if it cannot be added, ask the owner.
+
 ## Context to read first
 
 - `src/lib/content/schema.ts` (`projectMetaSchema`: the frontmatter contract, including the `completed` refine).
 - One existing project of the same kind in `src/content/projects/` (`picopal.mdx` for hardware, `scaleforge.mdx` or `p2p-ble-app.mdx` for software): house structure and voice.
 - `src/components/content/Mdx.tsx` and `blocks.tsx`: what MDX can render.
-- `../.internal/projects/<slug>/evidence.md` if it exists (update mode, or a resumed run).
+- `<rules>/projects/<slug>/evidence.md` if it exists (update mode, or a resumed run).
 - `ls src/content/projects` for slugs and the next `order` value.
 
 ## 1. Intake interview
@@ -37,7 +39,7 @@ Second call, still before reading code:
 
 ## 2. Evidence pass (read-only)
 
-Read the source with Read/Grep/ls only. Never run, build, flash, or modify it. Write `../.internal/projects/<slug>/evidence.md` (outside the published repo) with these sections, matching `../.internal/evidence-*.md`:
+Read the source with Read/Grep/ls only. Never run, build, flash, or modify it. Write `<rules>/projects/<slug>/evidence.md` (private, outside the published repo) with these sections, matching `<rules>/evidence-*.md`:
 
 1. Inventory: folders, docs, size (lines of code, test count by static grep, labelled "not re-run").
 2. Built vs planned vs in progress, each with the file that proves it.
@@ -120,11 +122,11 @@ Then `npm run dev`, open `/projects/<slug>/`: every Mermaid diagram renders (not
 
 ## 5. Independent review
 
-Spawn a **fresh** `Agent` (`model: "opus"`) that did not write the page. It reads `evidence.md`, the MDX and the SVGs, and writes `../.internal/projects/<slug>/review.md`: every claim traced to evidence or an owner answer, diagrams consistent with the prose (names, order, direction), pin map and BOM consistent with the schematic, no secrets, voice rules, no padded sections. Findings tagged `must-fix` / `should-fix` with `file:line`. Fix every must-fix, re-run Verify.
+Spawn a **fresh** `Agent` (`model: "opus"`) that did not write the page. It reads `evidence.md`, the MDX and the SVGs, and writes `<rules>/projects/<slug>/review.md`: every claim traced to evidence or an owner answer, diagrams consistent with the prose (names, order, direction), pin map and BOM consistent with the schematic, no secrets, voice rules, no padded sections. Findings tagged `must-fix` / `should-fix` with `file:line`. Fix every must-fix, re-run Verify.
 
 ## Update mode (`update <slug>`)
 
-1. Read the MDX and `../.internal/projects/<slug>/evidence.md`.
+1. Read the MDX and `<rules>/projects/<slug>/evidence.md`.
 2. Ask the owner what changed (status, new features, new issues, photos, links), up to 4 questions per call.
 3. Re-read only the source areas that changed; append to `evidence.md`.
 4. Edit only the affected sections; keep the rest verbatim. Update `status`/`completed`/`statusNote`, `tldr`, and move items out of Planned but Restricted when they ship.
@@ -133,4 +135,4 @@ Spawn a **fresh** `Agent` (`model: "opus"`) that did not write the page. It read
 
 ## Report
 
-≤15 lines: files created/changed, word count, diagrams and images added, check results with pass counts, review findings (fixed / left with reason), unknowns still open, anything skipped. Do not commit or push unless asked.
+≤15 lines: files created/changed, word count, diagrams and images added, check results with pass counts, review findings (fixed / left with reason), unknowns still open, anything skipped. Then publish as `CLAUDE.md` "Publishing" says (commit and push to `main`) once Verify passes, unless the user asked to hold it.
